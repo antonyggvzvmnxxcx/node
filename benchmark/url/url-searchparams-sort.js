@@ -1,6 +1,5 @@
 'use strict';
 const common = require('../common.js');
-const URLSearchParams = require('url').URLSearchParams;
 
 const inputs = {
   wpt: 'wpt',  // To work around tests
@@ -39,7 +38,7 @@ function main({ type, n }) {
   const array = getParams(input);
 
   bench.start();
-  for (var i = 0; i < n; i++) {
+  for (let i = 0; i < n; i++) {
     params[searchParams] = array.slice();
     params.sort();
   }

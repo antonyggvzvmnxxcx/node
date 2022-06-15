@@ -70,7 +70,7 @@ const ca = readKey('fake-startcom-root-cert.pem', 'binary');
         }
       );
     });
-    const longInput = 'http://foo.bar' + 'a'.repeat(16383);
+    const longInput = `http://foo.bar${'a'.repeat(16383)}`;
     throws(
       () => session.origin(longInput),
       {
@@ -85,10 +85,10 @@ const ca = readKey('fake-startcom-root-cert.pem', 'binary');
     const client = connect(originSet[0], { ca });
     const checks = [
       ['https://foo.org', 'https://bar.org'],
-      ['https://example.org', 'https://example.com']
+      ['https://example.org', 'https://example.com'],
     ];
 
-    const countdown = new Countdown(2, () => {
+    const countdown = new Countdown(3, () => {
       client.close();
       server.close();
     });
@@ -101,13 +101,13 @@ const ca = readKey('fake-startcom-root-cert.pem', 'binary');
       countdown.dec();
     }, 2));
 
-    client.request().on('close', mustCall()).resume();
+    client.request().on('close', mustCall(() => countdown.dec())).resume();
   }));
 }
 
 // Test automatically sending origin on connection start
 {
-  const origins = [ 'https://foo.org/a/b/c', 'https://bar.org' ];
+  const origins = ['https://foo.org/a/b/c', 'https://bar.org'];
   const server = createSecureServer({ key, cert, origins });
   server.on('stream', mustCall((stream) => {
     stream.respond();
@@ -119,15 +119,19 @@ const ca = readKey('fake-startcom-root-cert.pem', 'binary');
     const originSet = [`https://localhost:${server.address().port}`];
     const client = connect(originSet[0], { ca });
 
+    const countdown = new Countdown(2, () => {
+      client.close();
+      server.close();
+    });
+
     client.on('origin', mustCall((origins) => {
       originSet.push(...check);
       deepStrictEqual(client.originSet, originSet);
       deepStrictEqual(origins, check);
-      client.close();
-      server.close();
+      countdown.dec();
     }));
 
-    client.request().on('close', mustCall()).resume();
+    client.request().on('close', mustCall(() => countdown.dec())).resume();
   }));
 }
 

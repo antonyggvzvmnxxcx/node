@@ -7,7 +7,7 @@
 
 #include "src/objects/js-array.h"
 
-#include "src/objects-inl.h"  // Needed for write barriers
+#include "src/objects/objects-inl.h"  // Needed for write barriers
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -15,13 +15,24 @@
 namespace v8 {
 namespace internal {
 
-OBJECT_CONSTRUCTORS_IMPL(JSArray, JSObject)
-OBJECT_CONSTRUCTORS_IMPL(JSArrayIterator, JSObject)
+#include "torque-generated/src/objects/js-array-tq-inl.inc"
 
-CAST_ACCESSOR(JSArray)
-CAST_ACCESSOR(JSArrayIterator)
+TQ_OBJECT_CONSTRUCTORS_IMPL(JSArray)
+TQ_OBJECT_CONSTRUCTORS_IMPL(JSArrayIterator)
 
-ACCESSORS(JSArray, length, Object, kLengthOffset)
+DEF_GETTER(JSArray, length, Object) {
+  return TaggedField<Object, kLengthOffset>::load(cage_base, *this);
+}
+
+void JSArray::set_length(Object value, WriteBarrierMode mode) {
+  // Note the relaxed atomic store.
+  TaggedField<Object, kLengthOffset>::Relaxed_Store(*this, value);
+  CONDITIONAL_WRITE_BARRIER(*this, kLengthOffset, value, mode);
+}
+
+Object JSArray::length(PtrComprCageBase cage_base, RelaxedLoadTag tag) const {
+  return TaggedField<Object, kLengthOffset>::Relaxed_Load(cage_base, *this);
+}
 
 void JSArray::set_length(Smi length) {
   // Don't need a write barrier for a Smi.
@@ -30,12 +41,6 @@ void JSArray::set_length(Smi length) {
 
 bool JSArray::SetLengthWouldNormalize(Heap* heap, uint32_t new_length) {
   return new_length > kMaxFastArrayLength;
-}
-
-bool JSArray::AllowsSetLength() {
-  bool result = elements()->IsFixedArray() || elements()->IsFixedDoubleArray();
-  DCHECK(result == !HasFixedTypedArrayElements());
-  return result;
 }
 
 void JSArray::SetContent(Handle<JSArray> array,
@@ -55,19 +60,17 @@ void JSArray::SetContent(Handle<JSArray> array,
 }
 
 bool JSArray::HasArrayPrototype(Isolate* isolate) {
-  return map()->prototype() == *isolate->initial_array_prototype();
+  return map().prototype() == *isolate->initial_array_prototype();
 }
 
-ACCESSORS(JSArrayIterator, iterated_object, Object, kIteratedObjectOffset)
-ACCESSORS(JSArrayIterator, next_index, Object, kNextIndexOffset)
+SMI_ACCESSORS(JSArrayIterator, raw_kind, kKindOffset)
 
 IterationKind JSArrayIterator::kind() const {
-  return static_cast<IterationKind>(
-      Smi::cast(READ_FIELD(*this, kKindOffset))->value());
+  return static_cast<IterationKind>(raw_kind());
 }
 
 void JSArrayIterator::set_kind(IterationKind kind) {
-  WRITE_FIELD(*this, kKindOffset, Smi::FromInt(static_cast<int>(kind)));
+  set_raw_kind(static_cast<int>(kind));
 }
 
 }  // namespace internal

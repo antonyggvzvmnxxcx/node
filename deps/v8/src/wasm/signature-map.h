@@ -2,12 +2,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#if !V8_ENABLE_WEBASSEMBLY
+#error This header should only be included if WebAssembly is enabled.
+#endif  // !V8_ENABLE_WEBASSEMBLY
+
 #ifndef V8_WASM_SIGNATURE_MAP_H_
 #define V8_WASM_SIGNATURE_MAP_H_
 
 #include <unordered_map>
 
-#include "src/signature.h"
+#include "src/codegen/signature.h"
 #include "src/wasm/value-type.h"
 
 namespace v8 {
@@ -33,6 +37,10 @@ class V8_EXPORT_PRIVATE SignatureMap {
 
   // Disallows further insertions to this signature map.
   void Freeze() { frozen_ = true; }
+
+  size_t size() const { return map_.size(); }
+
+  bool is_frozen() const { return frozen_; }
 
  private:
   bool frozen_ = false;

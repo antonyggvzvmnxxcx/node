@@ -11,7 +11,7 @@
 namespace v8 {
 namespace internal {
 
-class BailoutId;
+class BytecodeOffset;
 class OptimizedCompilationInfo;
 
 namespace compiler {
@@ -41,6 +41,10 @@ class JSInliner final : public AdvancedReducer {
   // using the above generic reducer interface of the inlining machinery.
   Reduction ReduceJSCall(Node* node);
 
+#if V8_ENABLE_WEBASSEMBLY
+  Reduction ReduceJSWasmCall(Node* node);
+#endif  // V8_ENABLE_WEBASSEMBLY
+
  private:
   Zone* zone() const { return local_zone_; }
   CommonOperatorBuilder* common() const;
@@ -51,7 +55,6 @@ class JSInliner final : public AdvancedReducer {
   // TODO(neis): Make heap broker a component of JSGraph?
   JSHeapBroker* broker() const { return broker_; }
   Isolate* isolate() const { return jsgraph_->isolate(); }
-  Handle<Context> native_context() const;
 
   Zone* const local_zone_;
   OptimizedCompilationInfo* info_;
@@ -59,21 +62,25 @@ class JSInliner final : public AdvancedReducer {
   JSHeapBroker* const broker_;
   SourcePositionTable* const source_positions_;
 
-  bool DetermineCallTarget(Node* node,
-                           Handle<SharedFunctionInfo>& shared_info_out);
-  void DetermineCallContext(Node* node, Node*& context_out,
-                            Handle<FeedbackVector>& feedback_vector_out);
+  base::Optional<SharedFunctionInfoRef> DetermineCallTarget(Node* node);
+  FeedbackCellRef DetermineCallContext(Node* node, Node** context_out);
 
-  Node* CreateArtificialFrameState(Node* node, Node* outer_frame_state,
-                                   int parameter_count, BailoutId bailout_id,
-                                   FrameStateType frame_state_type,
-                                   Handle<SharedFunctionInfo> shared,
-                                   Node* context = nullptr);
+  FrameState CreateArtificialFrameState(
+      Node* node, FrameState outer_frame_state, int parameter_count,
+      BytecodeOffset bailout_id, FrameStateType frame_state_type,
+      SharedFunctionInfoRef shared, Node* context = nullptr);
 
   Reduction InlineCall(Node* call, Node* new_target, Node* context,
-                       Node* frame_state, Node* start, Node* end,
+                       Node* frame_state, StartNode start, Node* end,
                        Node* exception_target,
-                       const NodeVector& uncaught_subcalls);
+                       const NodeVector& uncaught_subcalls, int argument_count);
+
+#if V8_ENABLE_WEBASSEMBLY
+  Reduction InlineJSWasmCall(Node* call, Node* new_target, Node* context,
+                             Node* frame_state, StartNode start, Node* end,
+                             Node* exception_target,
+                             const NodeVector& uncaught_subcalls);
+#endif  // V8_ENABLE_WEBASSEMBLY
 };
 
 }  // namespace compiler

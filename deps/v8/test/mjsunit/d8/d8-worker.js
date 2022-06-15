@@ -82,8 +82,16 @@ var workerScript =
            if (t[i] !== i)
              throw new Error('ArrayBuffer transfer value ' + i);
          break;
+      case 10:
+        if (JSON.stringify(m) !== '{"foo":{},"err":{}}')
+          throw new Error('Object ' + JSON.stringify(m));
+        break;
+      case 11:
+        if (m.message != "message")
+          throw new Error('Error ' + JSON.stringify(m));
+        break;
      }
-     if (c == 10) {
+     if (c == 12) {
        postMessage('DONE');
      }
    };`;
@@ -147,12 +155,12 @@ if (this.Worker) {
   // Clone ArrayBuffer
   var ab1 = createArrayBuffer(16);
   w.postMessage(ab1);
-  assertEquals(16, ab1.byteLength);  // ArrayBuffer should not be neutered.
+  assertEquals(16, ab1.byteLength);  // ArrayBuffer should not be detached.
 
   // Transfer ArrayBuffer
   var ab2 = createArrayBuffer(32);
   w.postMessage(ab2, [ab2]);
-  assertEquals(0, ab2.byteLength);  // ArrayBuffer should be neutered.
+  assertEquals(0, ab2.byteLength);  // ArrayBuffer should be detached.
 
   // Attempting to transfer the same ArrayBuffer twice should throw.
   assertThrows(function() {
@@ -161,6 +169,13 @@ if (this.Worker) {
   });
 
   assertEquals("undefined", typeof foo);
+
+  // Transfer Error
+  const err = new Error();
+  w.postMessage({ foo: err, err })
+
+  // Transfer single Error
+  w.postMessage(new Error("message"))
 
   // Read a message from the worker.
   assertEquals("DONE", w.getMessage());

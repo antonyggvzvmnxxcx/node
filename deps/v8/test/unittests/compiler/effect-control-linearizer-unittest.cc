@@ -32,15 +32,14 @@ class EffectControlLinearizerTest : public GraphTest {
         simplified_(zone()),
         jsgraph_(isolate(), graph(), common(), &javascript_, &simplified_,
                  &machine_) {
-    source_positions_ = new (zone()) SourcePositionTable(graph());
-    node_origins_ = new (zone()) NodeOriginTable(graph());
+    source_positions_ = zone()->New<SourcePositionTable>(graph());
+    node_origins_ = zone()->New<NodeOriginTable>(graph());
   }
 
   JSGraph* jsgraph() { return &jsgraph_; }
   SimplifiedOperatorBuilder* simplified() { return &simplified_; }
   SourcePositionTable* source_positions() { return source_positions_; }
   NodeOriginTable* node_origins() { return node_origins_; }
-  std::vector<Handle<Map>>* maps() { return &maps_; }
 
  private:
   MachineOperatorBuilder machine_;
@@ -49,7 +48,6 @@ class EffectControlLinearizerTest : public GraphTest {
   JSGraph jsgraph_;
   SourcePositionTable* source_positions_;
   NodeOriginTable* node_origins_;
-  std::vector<Handle<Map>> maps_;
 };
 
 namespace {
@@ -87,10 +85,8 @@ TEST_F(EffectControlLinearizerTest, SimpleLoad) {
   schedule.AddReturn(start, ret);
 
   // Run the state effect introducer.
-  EffectControlLinearizer introducer(
-      jsgraph(), &schedule, zone(), source_positions(), node_origins(),
-      EffectControlLinearizer::kDoNotMaskArrayIndex, maps());
-  introducer.Run();
+  LinearizeEffectControl(jsgraph(), &schedule, zone(), source_positions(),
+                         node_origins(), broker());
 
   EXPECT_THAT(load,
               IsLoadField(AccessBuilder::ForHeapNumberValue(), heap_number,
@@ -150,10 +146,8 @@ TEST_F(EffectControlLinearizerTest, DiamondLoad) {
   schedule.AddReturn(mblock, ret);
 
   // Run the state effect introducer.
-  EffectControlLinearizer introducer(
-      jsgraph(), &schedule, zone(), source_positions(), node_origins(),
-      EffectControlLinearizer::kDoNotMaskArrayIndex, maps());
-  introducer.Run();
+  LinearizeEffectControl(jsgraph(), &schedule, zone(), source_positions(),
+                         node_origins(), broker());
 
   // The effect input to the return should be an effect phi with the
   // newly introduced effectful change operators.
@@ -218,10 +212,8 @@ TEST_F(EffectControlLinearizerTest, LoopLoad) {
   schedule.AddReturn(rblock, ret);
 
   // Run the state effect introducer.
-  EffectControlLinearizer introducer(
-      jsgraph(), &schedule, zone(), source_positions(), node_origins(),
-      EffectControlLinearizer::kDoNotMaskArrayIndex, maps());
-  introducer.Run();
+  LinearizeEffectControl(jsgraph(), &schedule, zone(), source_positions(),
+                         node_origins(), broker());
 
   ASSERT_THAT(ret, IsReturn(load, load, if_true));
   EXPECT_THAT(load, IsLoadField(AccessBuilder::ForHeapNumberValue(),
@@ -282,10 +274,8 @@ TEST_F(EffectControlLinearizerTest, CloneBranch) {
   schedule.AddNode(mblock, merge);
   schedule.AddNode(mblock, graph()->end());
 
-  EffectControlLinearizer introducer(
-      jsgraph(), &schedule, zone(), source_positions(), node_origins(),
-      EffectControlLinearizer::kDoNotMaskArrayIndex, maps());
-  introducer.Run();
+  LinearizeEffectControl(jsgraph(), &schedule, zone(), source_positions(),
+                         node_origins(), broker());
 
   Capture<Node *> branch1_capture, branch2_capture;
   EXPECT_THAT(

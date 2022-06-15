@@ -29,12 +29,14 @@ from __future__ import print_function
 
 import test
 import os
-from os.path import join, exists, basename, isdir
+from os.path import join, exists, basename, dirname, isdir
 import re
+import sys
 import utils
 from functools import reduce
 
 FLAGS_PATTERN = re.compile(r"//\s+Flags:(.*)")
+PTY_HELPER = join(dirname(__file__), 'pty_helper.py')
 
 class TTYTestCase(test.TestCase):
 
@@ -46,6 +48,7 @@ class TTYTestCase(test.TestCase):
     self.config = config
     self.arch = arch
     self.mode = mode
+    self.parallel = True
 
   def IgnoreLine(self, str_arg):
     """Ignore empty lines and valgrind output."""
@@ -68,7 +71,7 @@ class TTYTestCase(test.TestCase):
     raw_lines = (output.stdout + output.stderr).split('\n')
     outlines = [ s.rstrip() for s in raw_lines if not self.IgnoreLine(s) ]
     if len(outlines) != len(patterns):
-      print("length differs.")
+      print(" length differs.")
       print("expect=%d" % len(patterns))
       print("actual=%d" % len(outlines))
       print("patterns:")
@@ -80,7 +83,7 @@ class TTYTestCase(test.TestCase):
       return True
     for i in range(len(patterns)):
       if not re.match(patterns[i], outlines[i]):
-        print("match failed")
+        print(" match failed")
         print("line=%d" % i)
         print("expect=%s" % patterns[i])
         print("actual=%s" % outlines[i])
@@ -108,16 +111,18 @@ class TTYTestCase(test.TestCase):
           + open(self.expected).read())
 
   def RunCommand(self, command, env):
-    input_arg = None
+    fd = None
     if self.input is not None and exists(self.input):
-      input_arg = open(self.input).read()
+      fd = os.open(self.input, os.O_RDONLY)
     full_command = self.context.processor(command)
+    full_command = [sys.executable, PTY_HELPER] + full_command
     output = test.Execute(full_command,
                      self.context,
                      self.context.GetTimeout(self.mode),
                      env,
-                     faketty=True,
-                     input=input_arg)
+                     stdin=fd)
+    if fd is not None:
+      os.close(fd)
     return test.TestOutput(self,
                       full_command,
                       output,

@@ -5,7 +5,11 @@
 #ifndef V8_COMPILER_C_SIGNATURE_H_
 #define V8_COMPILER_C_SIGNATURE_H_
 
-#include "src/machine-type.h"
+#ifdef V8_USE_SIMULATOR_WITH_GENERIC_C_CALLS
+#include "include/v8-fast-api-calls.h"
+#endif  // V8_USE_SIMULATOR_WITH_GENERIC_C_CALLS
+
+#include "src/codegen/machine-type.h"
 
 namespace v8 {
 namespace internal {
@@ -42,6 +46,12 @@ inline constexpr MachineType MachineTypeForC() {
 FOREACH_CTYPE_MACHINE_TYPE_MAPPING(DECLARE_TEMPLATE_SPECIALIZATION)
 #undef DECLARE_TEMPLATE_SPECIALIZATION
 
+#ifdef V8_USE_SIMULATOR_WITH_GENERIC_C_CALLS
+template <>
+inline MachineType constexpr MachineTypeForC<v8::AnyCType>() {
+  return MachineType::Int64();
+}
+#endif  // V8_USE_SIMULATOR_WITH_GENERIC_C_CALLS
 // Helper for building machine signatures from C types.
 class CSignature : public MachineSignature {
  protected:
@@ -49,6 +59,8 @@ class CSignature : public MachineSignature {
       : MachineSignature(return_count, parameter_count, reps) {}
 
  public:
+  friend Zone;
+
   template <typename... Params>
   static void VerifyParams(MachineSignature* sig) {
     // Verifies the C signature against the machine types.
@@ -83,7 +95,7 @@ class CSignature : public MachineSignature {
       buffer[pos++] = p;
     }
     DCHECK_EQ(buffer_size, pos);
-    return new (zone) CSignature(return_count, param_count, buffer);
+    return zone->New<CSignature>(return_count, param_count, buffer);
   }
 };
 
@@ -98,8 +110,17 @@ class CSignatureOf : public CSignature {
     static_assert(
         std::is_same<decltype(*reps_), decltype(*param_types.data())>::value,
         "type mismatch, cannot memcpy");
-    memcpy(storage_ + kReturnCount, param_types.data(),
-           sizeof(*storage_) * kParamCount);
+    if (kParamCount > 0) {
+#if V8_CC_GNU
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
+#endif
+      memcpy(storage_ + kReturnCount, param_types.data(),
+             sizeof(*storage_) * kParamCount);
+#if V8_CC_GNU
+#pragma GCC diagnostic pop
+#endif
+    }
   }
 
  private:
@@ -110,11 +131,11 @@ class CSignatureOf : public CSignature {
   MachineType storage_[kReturnCount + kParamCount];
 };
 
-typedef CSignatureOf<int32_t, int32_t, int32_t> CSignature_i_ii;
-typedef CSignatureOf<uint32_t, uint32_t, uint32_t> CSignature_u_uu;
-typedef CSignatureOf<float, float, float> CSignature_f_ff;
-typedef CSignatureOf<double, double, double> CSignature_d_dd;
-typedef CSignatureOf<Object, Object, Object> CSignature_o_oo;
+using CSignature_i_ii = CSignatureOf<int32_t, int32_t, int32_t>;
+using CSignature_u_uu = CSignatureOf<uint32_t, uint32_t, uint32_t>;
+using CSignature_f_ff = CSignatureOf<float, float, float>;
+using CSignature_d_dd = CSignatureOf<double, double, double>;
+using CSignature_o_oo = CSignatureOf<Object, Object, Object>;
 
 }  // namespace compiler
 }  // namespace internal

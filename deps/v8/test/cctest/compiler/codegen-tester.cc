@@ -5,7 +5,7 @@
 #include "test/cctest/compiler/codegen-tester.h"
 
 #include "src/base/overflowing-math.h"
-#include "src/objects-inl.h"
+#include "src/objects/objects-inl.h"
 #include "test/cctest/cctest.h"
 #include "test/cctest/compiler/value-helper.h"
 
@@ -279,7 +279,7 @@ TEST(CompareWrapper) {
 
 
 void Int32BinopInputShapeTester::TestAllInputShapes() {
-  Vector<const int32_t> inputs = ValueHelper::int32_vector();
+  base::Vector<const int32_t> inputs = ValueHelper::int32_vector();
   int num_int_inputs = static_cast<int>(inputs.size());
   if (num_int_inputs > 16) num_int_inputs = 16;  // limit to 16 inputs
 

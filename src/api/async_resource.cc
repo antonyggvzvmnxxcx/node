@@ -4,7 +4,6 @@
 namespace node {
 
 using v8::Function;
-using v8::HandleScope;
 using v8::Isolate;
 using v8::Local;
 using v8::MaybeLocal;
@@ -25,7 +24,6 @@ AsyncResource::AsyncResource(Isolate* isolate,
 
 AsyncResource::~AsyncResource() {
   EmitAsyncDestroy(env_, async_context_);
-  resource_.Reset();
 }
 
 MaybeLocal<Value> AsyncResource::MakeCallback(Local<Function> callback,
@@ -64,10 +62,8 @@ async_id AsyncResource::get_trigger_async_id() const {
   return async_context_.trigger_async_id;
 }
 
-// TODO(addaleax): We shouldn’t need to use env_->isolate() if we’re just going
-// to end up using the Isolate* to figure out the Environment* again.
 AsyncResource::CallbackScope::CallbackScope(AsyncResource* res)
-    : node::CallbackScope(res->env_->isolate(),
+    : node::CallbackScope(res->env_,
                           res->resource_.Get(res->env_->isolate()),
                           res->async_context_) {}
 

@@ -5,8 +5,7 @@
 #ifndef V8_OBJECTS_ODDBALL_H_
 #define V8_OBJECTS_ODDBALL_H_
 
-#include "src/objects/heap-object.h"
-#include "torque-generated/class-definitions-from-dsl.h"
+#include "src/objects/primitive-heap-object.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -14,12 +13,13 @@
 namespace v8 {
 namespace internal {
 
+#include "torque-generated/src/objects/oddball-tq.inc"
+
 // The Oddball describes objects null, undefined, true, and false.
-class Oddball : public HeapObject {
+class Oddball : public PrimitiveHeapObject {
  public:
   // [to_number_raw]: Cached raw to_number computed at startup.
-  inline double to_number_raw() const;
-  inline void set_to_number_raw(double value);
+  DECL_PRIMITIVE_ACCESSORS(to_number_raw, double)
   inline void set_to_number_raw_as_bits(uint64_t bits);
 
   // [to_string]: Cached to_string computed at startup.
@@ -38,6 +38,8 @@ class Oddball : public HeapObject {
   V8_WARN_UNUSED_RESULT static inline Handle<Object> ToNumber(
       Isolate* isolate, Handle<Oddball> input);
 
+  V8_INLINE bool ToBool(Isolate* isolate) const;
+
   DECL_CAST(Oddball)
 
   // Dispatched behavior.
@@ -48,11 +50,13 @@ class Oddball : public HeapObject {
                          const char* to_string, Handle<Object> to_number,
                          const char* type_of, byte kind);
 
-  DEFINE_FIELD_OFFSET_CONSTANTS(HeapObject::kHeaderSize,
-                                TORQUE_GENERATED_ODDBALL_FIELDS)
-  // TODO(v8:8989): [torque] Support marker constants.
-  static const int kTaggedFieldsStartOffset = kToStringOffset;
-  static const int kTaggedFieldsEndOffset = kKindOffset;
+  // Layout description.
+  DECL_FIELD_OFFSET_TQ(ToNumberRaw, HeapObject::kHeaderSize, "float64")
+  DECL_FIELD_OFFSET_TQ(ToString, kToNumberRawOffset + kDoubleSize, "String")
+  DECL_FIELD_OFFSET_TQ(ToNumber, kToStringOffset + kTaggedSize, "Number")
+  DECL_FIELD_OFFSET_TQ(TypeOf, kToNumberOffset + kTaggedSize, "String")
+  DECL_FIELD_OFFSET_TQ(Kind, kTypeOfOffset + kTaggedSize, "Smi")
+  static const int kSize = kKindOffset + kTaggedSize;
 
   static const byte kFalse = 0;
   static const byte kTrue = 1;
@@ -67,15 +71,18 @@ class Oddball : public HeapObject {
   static const byte kOptimizedOut = 9;
   static const byte kStaleRegister = 10;
   static const byte kSelfReferenceMarker = 10;
+  static const byte kBasicBlockCountersMarker = 11;
 
-  using BodyDescriptor = FixedBodyDescriptor<kTaggedFieldsStartOffset,
-                                             kTaggedFieldsEndOffset, kSize>;
+  using BodyDescriptor =
+      FixedBodyDescriptor<kToStringOffset, kKindOffset, kSize>;
 
   STATIC_ASSERT(kKindOffset == Internals::kOddballKindOffset);
   STATIC_ASSERT(kNull == Internals::kNullOddballKind);
   STATIC_ASSERT(kUndefined == Internals::kUndefinedOddballKind);
 
-  OBJECT_CONSTRUCTORS(Oddball, HeapObject);
+  DECL_PRINTER(Oddball)
+
+  OBJECT_CONSTRUCTORS(Oddball, PrimitiveHeapObject);
 };
 
 }  // namespace internal

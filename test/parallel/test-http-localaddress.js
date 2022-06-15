@@ -42,6 +42,7 @@ const server = http.createServer((req, res) => {
 server.listen(0, '127.0.0.1', () => {
   const options = { host: 'localhost',
                     port: server.address().port,
+                    family: 4,
                     path: '/',
                     method: 'GET',
                     localAddress: '127.0.0.2' };
@@ -49,7 +50,6 @@ server.listen(0, '127.0.0.1', () => {
   const req = http.request(options, function(res) {
     res.on('end', () => {
       server.close();
-      process.exit();
     });
     res.resume();
   });

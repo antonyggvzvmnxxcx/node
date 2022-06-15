@@ -46,11 +46,10 @@ function TestArrayBufferCreation() {
   assertThrows(function() { new ArrayBuffer(-10); }, RangeError);
   assertThrows(function() { new ArrayBuffer(-2.567); }, RangeError);
 
-/* TODO[dslomov]: Reenable the test
   assertThrows(function() {
-    var ab1 = new ArrayBuffer(0xFFFFFFFFFFFF)
+    let kArrayBufferByteLengthLimit = %ArrayBufferMaxByteLength() + 1;
+    var ab1 = new ArrayBuffer(kArrayBufferByteLengthLimit);
   }, RangeError);
-*/
 
   var ab = new ArrayBuffer();
   assertSame(0, ab.byteLength);
@@ -610,8 +609,10 @@ function TestTypedArraySet() {
   assertThrows(function() { a.set.call({}) }, TypeError);
   assertThrows(function() { a.set.call([]) }, TypeError);
 
-  assertThrows(function() { a.set(0); }, TypeError);
-  assertThrows(function() { a.set(0, 1); }, TypeError);
+  a.set(0);
+  assertArrayPrefix(expected, a);
+  a.set(0, 1);
+  assertArrayPrefix(expected, a);
 
   assertEquals(1, a.set.length);
 
@@ -641,7 +642,7 @@ function TestTypedArraySet() {
       return 1;
     }
   };
-  assertThrows(() => a111.set(evilarr), TypeError);
+  a111.set(evilarr);
   assertEquals(true, detached);
 
   // Check if the target is a typed array before converting offset to integer
@@ -815,10 +816,10 @@ function TestTypedArraysWithIllegalIndicesStrict() {
   assertEquals(255, a[s2]);
   assertEquals(0, a[-0]);
 
-  /* Chromium bug: 424619
-   * a[-Infinity] = 50;
-   * assertEquals(undefined, a[-Infinity]);
-   */
+
+  a[-Infinity] = 50;
+  assertEquals(undefined, a[-Infinity]);
+
   a[1.5] = 10;
   assertEquals(undefined, a[1.5]);
   var nan = Math.sqrt(-1);
@@ -975,7 +976,7 @@ assertThrows(function() { DataView(new ArrayBuffer()); }, TypeError);
 
 function TestNonConfigurableProperties(constructor) {
   var arr = new constructor([100])
-  assertFalse(Object.getOwnPropertyDescriptor(arr,"0").configurable)
+  assertTrue(Object.getOwnPropertyDescriptor(arr,"0").configurable)
   assertFalse(delete arr[0])
 }
 
@@ -993,8 +994,9 @@ for(i = 0; i < typedArrayConstructors.length; i++) {
 })();
 
 (function TestBufferLengthTooLong() {
+  const kLength = %TypedArrayMaxLength() + 1;
   try {
-    var buf = new ArrayBuffer(2147483648);
+    var buf = new ArrayBuffer(kLength);
   } catch (e) {
     // The ArrayBuffer allocation fails on 32-bit archs, so no need to try to
     // construct the typed array.

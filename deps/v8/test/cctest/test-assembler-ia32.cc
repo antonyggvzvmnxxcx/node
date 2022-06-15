@@ -27,24 +27,25 @@
 
 #include <stdlib.h>
 
-#include "src/v8.h"
-
-#include "src/assembler-inl.h"
+#include "include/v8-function.h"
 #include "src/base/platform/platform.h"
 #include "src/base/utils/random-number-generator.h"
-#include "src/disassembler.h"
+#include "src/codegen/assembler-inl.h"
+#include "src/codegen/macro-assembler.h"
+#include "src/deoptimizer/deoptimizer.h"
+#include "src/diagnostics/disassembler.h"
 #include "src/heap/factory.h"
-#include "src/macro-assembler.h"
-#include "src/ostreams.h"
+#include "src/init/v8.h"
+#include "src/utils/ostreams.h"
 #include "test/cctest/cctest.h"
+#include "test/common/assembler-tester.h"
 
 namespace v8 {
 namespace internal {
 
-typedef int (*F0)();
-typedef int (*F1)(int x);
-typedef int (*F2)(int x, int y);
-
+using F0 = int();
+using F1 = int(int x);
+using F2 = int(int x, int y);
 
 #define __ assm.
 
@@ -64,13 +65,13 @@ TEST(AssemblerIa320) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
-  F2 f = FUNCTION_CAST<F2>(code->entry());
-  int res = f(3, 4);
+  auto f = GeneratedCode<F2>::FromCode(*code);
+  auto res = f.Call(3, 4);
   ::printf("f() = %d\n", res);
   CHECK_EQ(7, res);
 }
@@ -102,13 +103,13 @@ TEST(AssemblerIa321) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
-  F1 f = FUNCTION_CAST<F1>(code->entry());
-  int res = f(100);
+  auto f = GeneratedCode<F1>::FromCode(*code);
+  int res = f.Call(100);
   ::printf("f() = %d\n", res);
   CHECK_EQ(5050, res);
 }
@@ -144,19 +145,18 @@ TEST(AssemblerIa322) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
-  F1 f = FUNCTION_CAST<F1>(code->entry());
-  int res = f(10);
+  auto f = GeneratedCode<F1>::FromCode(*code);
+  int res = f.Call(10);
   ::printf("f() = %d\n", res);
   CHECK_EQ(3628800, res);
 }
 
-
-typedef int (*F3)(float x);
+using F3 = int(float x);
 
 TEST(AssemblerIa323) {
   CcTest::InitializeVM();
@@ -174,19 +174,18 @@ TEST(AssemblerIa323) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
-  F3 f = FUNCTION_CAST<F3>(code->entry());
-  int res = f(static_cast<float>(-3.1415));
+  auto f = GeneratedCode<F3>::FromCode(*code);
+  int res = f.Call(-3.1415f);
   ::printf("f() = %d\n", res);
   CHECK_EQ(-3, res);
 }
 
-
-typedef int (*F4)(double x);
+using F4 = int(double x);
 
 TEST(AssemblerIa324) {
   CcTest::InitializeVM();
@@ -204,13 +203,13 @@ TEST(AssemblerIa324) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
-  F4 f = FUNCTION_CAST<F4>(code->entry());
-  int res = f(2.718281828);
+  auto f = GeneratedCode<F4>::FromCode(*code);
+  int res = f.Call(2.718281828);
   ::printf("f() = %d\n", res);
   CHECK_EQ(2, res);
 }
@@ -226,20 +225,19 @@ TEST(AssemblerIa325) {
   Assembler assm(AssemblerOptions{},
                  ExternalAssemblerBuffer(buffer, sizeof buffer));
 
-  __ mov(eax, Operand(reinterpret_cast<intptr_t>(&baz), RelocInfo::NONE));
+  __ mov(eax, Operand(reinterpret_cast<intptr_t>(&baz), RelocInfo::NO_INFO));
   __ ret(0);
 
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
-  F0 f = FUNCTION_CAST<F0>(code->entry());
-  int res = f();
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
+  auto f = GeneratedCode<F0>::FromCode(*code);
+  int res = f.Call();
   CHECK_EQ(42, res);
 }
 
-
-typedef double (*F5)(double x, double y);
+using F5 = double(double x, double y);
 
 TEST(AssemblerIa326) {
   CcTest::InitializeVM();
@@ -266,19 +264,18 @@ TEST(AssemblerIa326) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
-  F5 f = FUNCTION_CAST<F5>(code->entry());
-  double res = f(2.2, 1.1);
+  auto f = GeneratedCode<F5>::FromCode(*code);
+  double res = f.Call(2.2, 1.1);
   ::printf("f() = %f\n", res);
   CHECK(2.29 < res && res < 2.31);
 }
 
-
-typedef double (*F6)(int x);
+using F6 = double(int x);
 
 TEST(AssemblerIa328) {
   CcTest::InitializeVM();
@@ -299,13 +296,13 @@ TEST(AssemblerIa328) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
-  F6 f = FUNCTION_CAST<F6>(code->entry());
-  double res = f(12);
+  auto f = GeneratedCode<F6>::FromCode(*code);
+  double res = f.Call(12);
 
   ::printf("f() = %f\n", res);
   CHECK(11.99 < res && res < 12.001);
@@ -382,11 +379,11 @@ TEST(AssemblerMultiByteNop) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
   CHECK(code->IsCode());
 
-  F0 f = FUNCTION_CAST<F0>(code->entry());
-  int res = f();
+  auto f = GeneratedCode<F0>::FromCode(*code);
+  int res = f.Call();
   CHECK_EQ(42, res);
 }
 
@@ -433,10 +430,10 @@ void DoSSE2(const v8::FunctionCallbackInfo<v8::Value>& args) {
   assm.GetCode(isolate, &desc);
 
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 
-  F0 f = FUNCTION_CAST<F0>(code->entry());
-  int res = f();
+  auto f = GeneratedCode<F0>::FromCode(*code);
+  int res = f.Call();
   args.GetReturnValue().Set(v8::Integer::New(CcTest::isolate(), res));
 }
 
@@ -498,21 +495,21 @@ TEST(AssemblerIa32Extractps) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F4 f = FUNCTION_CAST<F4>(code->entry());
-  uint64_t value1 = V8_2PART_UINT64_C(0x12345678, 87654321);
-  CHECK_EQ(0x12345678, f(uint64_to_double(value1)));
-  uint64_t value2 = V8_2PART_UINT64_C(0x87654321, 12345678);
-  CHECK_EQ(static_cast<int>(0x87654321), f(uint64_to_double(value2)));
+  auto f = GeneratedCode<F4>::FromCode(*code);
+  uint64_t value1 = 0x1234'5678'8765'4321;
+  CHECK_EQ(0x12345678, f.Call(base::uint64_to_double(value1)));
+  uint64_t value2 = 0x8765'4321'1234'5678;
+  CHECK_EQ(static_cast<int>(0x87654321),
+           f.Call(base::uint64_to_double(value2)));
 }
 
-
-typedef int (*F8)(float x, float y);
+using F8 = int(float x, float y);
 TEST(AssemblerIa32SSE) {
   CcTest::InitializeVM();
 
@@ -538,14 +535,14 @@ TEST(AssemblerIa32SSE) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F8 f = FUNCTION_CAST<F8>(code->entry());
-  CHECK_EQ(2, f(1.0, 2.0));
+  auto f = GeneratedCode<F8>::FromCode(*code);
+  CHECK_EQ(2, f.Call(1.0, 2.0));
 }
 
 TEST(AssemblerIa32SSE3) {
@@ -571,17 +568,17 @@ TEST(AssemblerIa32SSE3) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F8 f = FUNCTION_CAST<F8>(code->entry());
-  CHECK_EQ(4, f(1.0, 2.0));
+  auto f = GeneratedCode<F8>::FromCode(*code);
+  CHECK_EQ(4, f.Call(1.0, 2.0));
 }
 
-typedef int (*F9)(double x, double y, double z);
+using F9 = int(double x, double y, double z);
 TEST(AssemblerX64FMA_sd) {
   CcTest::InitializeVM();
   if (!CpuFeatures::IsSupported(FMA3)) return;
@@ -603,7 +600,7 @@ TEST(AssemblerX64FMA_sd) {
     __ mulsd(xmm3, xmm1);
     __ addsd(xmm3, xmm2);  // Expected result in xmm3
 
-    __ sub(esp, Immediate(kDoubleSize));  // For memory operand
+    __ AllocateStackSpace(kDoubleSize);  // For memory operand
     // vfmadd132sd
     __ mov(eax, Immediate(1));  // Test number
     __ movaps(xmm4, xmm0);
@@ -799,18 +796,18 @@ TEST(AssemblerX64FMA_sd) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F9 f = FUNCTION_CAST<F9>(code->entry());
-  CHECK_EQ(0, f(0.000092662107262076, -2.460774966188315, -1.0958787393627414));
+  auto f = GeneratedCode<F9>::FromCode(*code);
+  CHECK_EQ(
+      0, f.Call(0.000092662107262076, -2.460774966188315, -1.0958787393627414));
 }
 
-
-typedef int (*F10)(float x, float y, float z);
+using F10 = int(float x, float y, float z);
 TEST(AssemblerX64FMA_ss) {
   CcTest::InitializeVM();
   if (!CpuFeatures::IsSupported(FMA3)) return;
@@ -832,7 +829,7 @@ TEST(AssemblerX64FMA_ss) {
     __ mulss(xmm3, xmm1);
     __ addss(xmm3, xmm2);  // Expected result in xmm3
 
-    __ sub(esp, Immediate(kDoubleSize));  // For memory operand
+    __ AllocateStackSpace(kDoubleSize);  // For memory operand
     // vfmadd132ss
     __ mov(eax, Immediate(1));  // Test number
     __ movaps(xmm4, xmm0);
@@ -1028,14 +1025,14 @@ TEST(AssemblerX64FMA_ss) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F10 f = FUNCTION_CAST<F10>(code->entry());
-  CHECK_EQ(0, f(9.26621069e-05f, -2.4607749f, -1.09587872f));
+  auto f = GeneratedCode<F10>::FromCode(*code);
+  CHECK_EQ(0, f.Call(9.26621069e-05f, -2.4607749f, -1.09587872f));
 }
 
 
@@ -1136,14 +1133,14 @@ TEST(AssemblerIa32BMI1) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F0 f = FUNCTION_CAST<F0>(code->entry());
-  CHECK_EQ(0, f());
+  auto f = GeneratedCode<F0>::FromCode(*code);
+  CHECK_EQ(0, f.Call());
 }
 
 
@@ -1184,14 +1181,14 @@ TEST(AssemblerIa32LZCNT) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F0 f = FUNCTION_CAST<F0>(code->entry());
-  CHECK_EQ(0, f());
+  auto f = GeneratedCode<F0>::FromCode(*code);
+  CHECK_EQ(0, f.Call());
 }
 
 
@@ -1232,14 +1229,14 @@ TEST(AssemblerIa32POPCNT) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F0 f = FUNCTION_CAST<F0>(code->entry());
-  CHECK_EQ(0, f());
+  auto f = GeneratedCode<F0>::FromCode(*code);
+  CHECK_EQ(0, f.Call());
 }
 
 
@@ -1378,14 +1375,14 @@ TEST(AssemblerIa32BMI2) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F0 f = FUNCTION_CAST<F0>(code->entry());
-  CHECK_EQ(0, f());
+  auto f = GeneratedCode<F0>::FromCode(*code);
+  CHECK_EQ(0, f.Call());
 }
 
 
@@ -1422,14 +1419,14 @@ TEST(AssemblerIa32JumpTables1) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
-  F1 f = FUNCTION_CAST<F1>(code->entry());
+  auto f = GeneratedCode<F1>::FromCode(*code);
   for (int i = 0; i < kNumCases; ++i) {
-    int res = f(i);
+    int res = f.Call(i);
     ::printf("f(%d) = %d\n", i, res);
     CHECK_EQ(values[i], res);
   }
@@ -1470,14 +1467,14 @@ TEST(AssemblerIa32JumpTables2) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
-  F1 f = FUNCTION_CAST<F1>(code->entry());
+  auto f = GeneratedCode<F1>::FromCode(*code);
   for (int i = 0; i < kNumCases; ++i) {
-    int res = f(i);
+    int res = f.Call(i);
     ::printf("f(%d) = %d\n", i, res);
     CHECK_EQ(values[i], res);
   }
@@ -1513,15 +1510,65 @@ TEST(Regress621926) {
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
-      isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
+      Factory::CodeBuilder(isolate, desc, CodeKind::FOR_TESTING).Build();
 
 #ifdef OBJECT_PRINT
   StdoutStream os;
   code->Print(os);
 #endif
 
-  F0 f = FUNCTION_CAST<F0>(code->entry());
-  CHECK_EQ(1, f());
+  auto f = GeneratedCode<F0>::FromCode(*code);
+  CHECK_EQ(1, f.Call());
+}
+
+TEST(DeoptExitSizeIsFixed) {
+  Isolate* isolate = CcTest::i_isolate();
+  HandleScope handles(isolate);
+  v8::internal::byte buffer[256];
+  MacroAssembler masm(isolate, v8::internal::CodeObjectRequired::kYes,
+                      ExternalAssemblerBuffer(buffer, sizeof(buffer)));
+
+  STATIC_ASSERT(static_cast<int>(kFirstDeoptimizeKind) == 0);
+  for (int i = 0; i < kDeoptimizeKindCount; i++) {
+    DeoptimizeKind kind = static_cast<DeoptimizeKind>(i);
+    Label before_exit;
+    masm.bind(&before_exit);
+    Builtin target = Deoptimizer::GetDeoptimizationEntry(kind);
+    masm.CallForDeoptimization(target, 42, &before_exit, kind, &before_exit,
+                               nullptr);
+    CHECK_EQ(masm.SizeOfCodeGeneratedSince(&before_exit),
+             kind == DeoptimizeKind::kLazy ? Deoptimizer::kLazyDeoptExitSize
+                                           : Deoptimizer::kEagerDeoptExitSize);
+  }
+}
+
+TEST(CpuFeatures_ProbeImpl) {
+  // Support for a newer extension implies support for the older extensions.
+  CHECK_IMPLIES(CpuFeatures::IsSupported(FMA3), CpuFeatures::IsSupported(AVX));
+  CHECK_IMPLIES(CpuFeatures::IsSupported(AVX2), CpuFeatures::IsSupported(AVX));
+  CHECK_IMPLIES(CpuFeatures::IsSupported(AVX),
+                CpuFeatures::IsSupported(SSE4_2));
+  CHECK_IMPLIES(CpuFeatures::IsSupported(SSE4_2),
+                CpuFeatures::IsSupported(SSE4_1));
+  CHECK_IMPLIES(CpuFeatures::IsSupported(SSE4_1),
+                CpuFeatures::IsSupported(SSSE3));
+  CHECK_IMPLIES(CpuFeatures::IsSupported(SSSE3),
+                CpuFeatures::IsSupported(SSE3));
+
+  // Check the reverse, if an older extension is not supported, a newer
+  // extension cannot be supported.
+  CHECK_IMPLIES(!CpuFeatures::IsSupported(SSE3),
+                !CpuFeatures::IsSupported(SSSE3));
+  CHECK_IMPLIES(!CpuFeatures::IsSupported(SSSE3),
+                !CpuFeatures::IsSupported(SSE4_1));
+  CHECK_IMPLIES(!CpuFeatures::IsSupported(SSE4_1),
+                !CpuFeatures::IsSupported(SSE4_2));
+  CHECK_IMPLIES(!CpuFeatures::IsSupported(SSE4_2),
+                !CpuFeatures::IsSupported(AVX));
+  CHECK_IMPLIES(!CpuFeatures::IsSupported(AVX),
+                !CpuFeatures::IsSupported(AVX2));
+  CHECK_IMPLIES(!CpuFeatures::IsSupported(AVX),
+                !CpuFeatures::IsSupported(FMA3));
 }
 
 #undef __

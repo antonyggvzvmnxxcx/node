@@ -2,12 +2,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+// Flags: --experimental-stack-trace-frames
+
 // Test wasm compilation explicitly, since this creates a promise which is only
 // resolved later, i.e. the message queue gets empty in-between.
 // The important part here is that d8 exits with a non-zero exit code.
 
-load('test/mjsunit/mjsunit.js');
-load('test/mjsunit/wasm/wasm-module-builder.js');
+d8.file.execute('test/mjsunit/mjsunit.js');
+d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
 
 assertPromiseResult((async function test() {
   let ok_buffer = (() => {

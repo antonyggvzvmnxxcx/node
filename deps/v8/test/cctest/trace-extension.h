@@ -28,12 +28,17 @@
 #ifndef V8_TEST_CCTEST_TRACE_EXTENSION_H_
 #define V8_TEST_CCTEST_TRACE_EXTENSION_H_
 
-#include "include/v8.h"
-#include "src/globals.h"
+#include "include/v8-extension.h"
+#include "src/common/globals.h"
 
 namespace v8 {
-struct TickSample;
+
+template <typename T>
+class FunctionCallbackInfo;
+
 namespace internal {
+
+struct TickSample;
 
 class TraceExtension : public v8::Extension {
  public:
@@ -45,7 +50,7 @@ class TraceExtension : public v8::Extension {
   static void JSEntrySP(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void JSEntrySPLevel2(const v8::FunctionCallbackInfo<v8::Value>& args);
   static Address GetJsEntrySp();
-  static void InitTraceEnv(v8::TickSample* sample);
+  static void InitTraceEnv(TickSample* sample);
   static void DoTrace(Address fp);
  private:
   static Address GetFP(const v8::FunctionCallbackInfo<v8::Value>& args);

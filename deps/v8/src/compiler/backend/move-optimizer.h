@@ -5,8 +5,8 @@
 #ifndef V8_COMPILER_BACKEND_MOVE_OPTIMIZER_H_
 #define V8_COMPILER_BACKEND_MOVE_OPTIMIZER_H_
 
+#include "src/common/globals.h"
 #include "src/compiler/backend/instruction.h"
-#include "src/globals.h"
 #include "src/zone/zone-containers.h"
 
 namespace v8 {
@@ -16,6 +16,9 @@ namespace compiler {
 class V8_EXPORT_PRIVATE MoveOptimizer final {
  public:
   MoveOptimizer(Zone* local_zone, InstructionSequence* code);
+  MoveOptimizer(const MoveOptimizer&) = delete;
+  MoveOptimizer& operator=(const MoveOptimizer&) = delete;
+
   void Run();
 
  private:
@@ -57,8 +60,6 @@ class V8_EXPORT_PRIVATE MoveOptimizer final {
   // at any given time, so we create two buffers.
   ZoneVector<InstructionOperand> operand_buffer1;
   ZoneVector<InstructionOperand> operand_buffer2;
-
-  DISALLOW_COPY_AND_ASSIGN(MoveOptimizer);
 };
 
 }  // namespace compiler

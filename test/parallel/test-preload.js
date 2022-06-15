@@ -23,7 +23,23 @@ const fixtureA = fixtures.path('printA.js');
 const fixtureB = fixtures.path('printB.js');
 const fixtureC = fixtures.path('printC.js');
 const fixtureD = fixtures.path('define-global.js');
+const fixtureE = fixtures.path('intrinsic-mutation.js');
+const fixtureF = fixtures.path('print-intrinsic-mutation-name.js');
+const fixtureG = fixtures.path('worker-from-argv.js');
 const fixtureThrows = fixtures.path('throws_error4.js');
+const fixtureIsPreloading = fixtures.path('ispreloading.js');
+
+// Assert that module.isPreloading is false here
+assert(!module.isPreloading);
+
+// Test that module.isPreloading is set in preloaded module
+// Test preloading a single module works
+childProcess.exec(
+  `"${nodeBinary}" ${preloadOption([fixtureIsPreloading])} "${fixtureB}"`,
+  function(err, stdout, stderr) {
+    assert.ifError(err);
+    assert.strictEqual(stdout, 'B\n');
+  });
 
 // Test preloading a single module works
 childProcess.exec(`"${nodeBinary}" ${preloadOption([fixtureA])} "${fixtureB}"`,
@@ -62,6 +78,32 @@ childProcess.exec(
   }
 );
 
+// Test that preload can be used with --frozen-intrinsics
+childProcess.exec(
+  `"${nodeBinary}" --frozen-intrinsics ${
+    preloadOption([fixtureE])
+  } ${
+    fixtureF
+  }`,
+  function(err, stdout) {
+    assert.ifError(err);
+    assert.strictEqual(stdout, 'smoosh\n');
+  }
+);
+childProcess.exec(
+  `"${
+    nodeBinary
+  }" --frozen-intrinsics ${
+    preloadOption([fixtureE])
+  } ${
+    fixtureG
+  } ${fixtureF}`,
+  function(err, stdout) {
+    assert.ifError(err);
+    assert.strictEqual(stdout, 'smoosh\n');
+  }
+);
+
 // Test that preload can be used with stdin
 const stdinProc = childProcess.spawn(
   nodeBinary,
@@ -93,7 +135,7 @@ replProc.on('close', function(code) {
   assert.strictEqual(code, 0);
   const output = [
     'A',
-    '> '
+    '> ',
   ];
   assert.ok(replStdout.startsWith(output[0]));
   assert.ok(replStdout.endsWith(output[1]));
@@ -113,8 +155,7 @@ childProcess.exec(
 // Test that preload works with -i
 const interactive = childProcess.exec(
   `"${nodeBinary}" ${preloadOption([fixtureD])}-i`,
-  common.mustCall(function(err, stdout, stderr) {
-    assert.ifError(err);
+  common.mustSucceed((stdout, stderr) => {
     assert.ok(stdout.endsWith("> 'test'\n> "));
   })
 );
@@ -127,7 +168,7 @@ childProcess.exec(
     fixtures.path('cluster-preload-test.js')}"`,
   function(err, stdout, stderr) {
     assert.ifError(err);
-    assert.ok(/worker terminated with code 43/.test(stdout));
+    assert.match(stdout, /worker terminated with code 43/);
   }
 );
 
@@ -135,8 +176,7 @@ childProcess.exec(
 childProcess.exec(
   `"${nodeBinary}" ${preloadOption(['./printA.js'])} "${fixtureB}"`,
   { cwd: fixtures.fixturesDir },
-  common.mustCall(function(err, stdout, stderr) {
-    assert.ifError(err);
+  common.mustSucceed((stdout, stderr) => {
     assert.strictEqual(stdout, 'A\nB\n');
   })
 );
@@ -145,8 +185,7 @@ if (common.isWindows) {
   childProcess.exec(
     `"${nodeBinary}" ${preloadOption(['.\\printA.js'])} "${fixtureB}"`,
     { cwd: fixtures.fixturesDir },
-    common.mustCall(function(err, stdout, stderr) {
-      assert.ifError(err);
+    common.mustSucceed((stdout, stderr) => {
       assert.strictEqual(stdout, 'A\nB\n');
     })
   );
@@ -159,6 +198,6 @@ childProcess.exec(
   { cwd: fixtures.fixturesDir },
   function(err, stdout, stderr) {
     assert.ifError(err);
-    assert.ok(/worker terminated with code 43/.test(stdout));
+    assert.match(stdout, /worker terminated with code 43/);
   }
 );

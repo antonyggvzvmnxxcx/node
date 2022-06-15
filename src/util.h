@@ -26,21 +26,30 @@
 
 #include "v8.h"
 
-#include <cassert>
-#include <climits>  // PATH_MAX
-#include <csignal>
+#include "node.h"
+
+#include <climits>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-#include <functional>  // std::function
-#include <limits>
-#include <set>
-#include <string>
 #include <array>
+#include <limits>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <set>
 #include <unordered_map>
 #include <utility>
+#include <vector>
+
+#ifdef __GNUC__
+#define MUST_USE_RESULT __attribute__((warn_unused_result))
+#else
+#define MUST_USE_RESULT
+#endif
 
 namespace node {
 
@@ -87,7 +96,7 @@ inline T MultiplyWithOverflowCheck(T a, T b);
 
 namespace per_process {
 // Tells whether the per-process V8::Initialize() is called and
-// if it is safe to call v8::Isolate::GetCurrent().
+// if it is safe to call v8::Isolate::TryGetCurrent().
 extern bool v8_initialized;
 }  // namespace per_process
 
@@ -103,8 +112,8 @@ struct AssertionInfo {
   const char* message;
   const char* function;
 };
-[[noreturn]] void Assert(const AssertionInfo& info);
-[[noreturn]] void Abort();
+[[noreturn]] void NODE_EXTERN_PRIVATE Assert(const AssertionInfo& info);
+[[noreturn]] void NODE_EXTERN_PRIVATE Abort();
 void DumpBacktrace(FILE* fp);
 
 // Windows 8+ does not like abort() in Release mode
@@ -183,6 +192,11 @@ void DumpBacktrace(FILE* fp);
 
 #define UNREACHABLE(...)                                                      \
   ERROR_AND_ABORT("Unreachable code reached" __VA_OPT__(": ") __VA_ARGS__)
+
+// ECMA262 20.1.2.6 Number.MAX_SAFE_INTEGER (2^53-1)
+constexpr int64_t kMaxSafeJsInteger = 9007199254740991;
+
+inline bool IsSafeJsInt(v8::Local<v8::Value> v);
 
 // TAILQ-style intrusive list node.
 template <typename T>
@@ -310,6 +324,16 @@ inline bool StringEqualNoCase(const char* a, const char* b);
 // strncasecmp() is locale-sensitive.  Use StringEqualNoCaseN() instead.
 inline bool StringEqualNoCaseN(const char* a, const char* b, size_t length);
 
+template <typename T, size_t N>
+constexpr size_t arraysize(const T (&)[N]) {
+  return N;
+}
+
+template <typename T, size_t N>
+constexpr size_t strsize(const T (&)[N]) {
+  return N - 1;
+}
+
 // Allocates an array of member type T. For up to kStackStorageSize items,
 // the stack is used, otherwise malloc().
 template <typename T, size_t kStackStorageSize = 1024>
@@ -349,8 +373,7 @@ class MaybeStackBuffer {
   // Current maximum capacity of the buffer with which SetLength() can be used
   // without first calling AllocateSufficientStorage().
   size_t capacity() const {
-    return IsAllocated() ? capacity_ :
-                           IsInvalidated() ? 0 : kStackStorageSize;
+    return capacity_;
   }
 
   // Make sure enough space for `storage` entries is available.
@@ -386,12 +409,13 @@ class MaybeStackBuffer {
     buf_[length] = T();
   }
 
-  // Make derefencing this object return nullptr.
+  // Make dereferencing this object return nullptr.
   // This method can be called multiple times throughout the lifetime of the
   // buffer, but once this has been called AllocateSufficientStorage() cannot
   // be used.
   void Invalidate() {
     CHECK(!IsAllocated());
+    capacity_ = 0;
     length_ = 0;
     buf_ = nullptr;
   }
@@ -412,10 +436,11 @@ class MaybeStackBuffer {
     CHECK(IsAllocated());
     buf_ = buf_st_;
     length_ = 0;
-    capacity_ = 0;
+    capacity_ = arraysize(buf_st_);
   }
 
-  MaybeStackBuffer() : length_(0), capacity_(0), buf_(buf_st_) {
+  MaybeStackBuffer()
+      : length_(0), capacity_(arraysize(buf_st_)), buf_(buf_st_) {
     // Default to a zero-length, null-terminated buffer.
     buf_[0] = T();
   }
@@ -462,6 +487,12 @@ class ArrayBufferViewContents {
 class Utf8Value : public MaybeStackBuffer<char> {
  public:
   explicit Utf8Value(v8::Isolate* isolate, v8::Local<v8::Value> value);
+
+  inline std::string ToString() const { return std::string(out(), length()); }
+
+  inline bool operator==(const char* a) const {
+    return strcmp(out(), a) == 0;
+  }
 };
 
 class TwoByteValue : public MaybeStackBuffer<uint16_t> {
@@ -472,16 +503,19 @@ class TwoByteValue : public MaybeStackBuffer<uint16_t> {
 class BufferValue : public MaybeStackBuffer<char> {
  public:
   explicit BufferValue(v8::Isolate* isolate, v8::Local<v8::Value> value);
+
+  inline std::string ToString() const { return std::string(out(), length()); }
 };
 
 #define SPREAD_BUFFER_ARG(val, name)                                          \
   CHECK((val)->IsArrayBufferView());                                          \
   v8::Local<v8::ArrayBufferView> name = (val).As<v8::ArrayBufferView>();      \
-  v8::ArrayBuffer::Contents name##_c = name->Buffer()->GetContents();         \
+  std::shared_ptr<v8::BackingStore> name##_bs =                               \
+      name->Buffer()->GetBackingStore();                                      \
   const size_t name##_offset = name->ByteOffset();                            \
   const size_t name##_length = name->ByteLength();                            \
   char* const name##_data =                                                   \
-      static_cast<char*>(name##_c.Data()) + name##_offset;                    \
+      static_cast<char*>(name##_bs->Data()) + name##_offset;                  \
   if (name##_length > 0)                                                      \
     CHECK_NE(name##_data, nullptr);
 
@@ -489,13 +523,36 @@ class BufferValue : public MaybeStackBuffer<char> {
 // silence a compiler warning about that.
 template <typename T> inline void USE(T&&) {}
 
-// Run a function when exiting the current scope.
-struct OnScopeLeave {
-  std::function<void()> fn_;
+template <typename Fn>
+struct OnScopeLeaveImpl {
+  Fn fn_;
+  bool active_;
 
-  explicit OnScopeLeave(std::function<void()> fn) : fn_(std::move(fn)) {}
-  ~OnScopeLeave() { fn_(); }
+  explicit OnScopeLeaveImpl(Fn&& fn) : fn_(std::move(fn)), active_(true) {}
+  ~OnScopeLeaveImpl() { if (active_) fn_(); }
+
+  OnScopeLeaveImpl(const OnScopeLeaveImpl& other) = delete;
+  OnScopeLeaveImpl& operator=(const OnScopeLeaveImpl& other) = delete;
+  OnScopeLeaveImpl(OnScopeLeaveImpl&& other)
+    : fn_(std::move(other.fn_)), active_(other.active_) {
+    other.active_ = false;
+  }
+  OnScopeLeaveImpl& operator=(OnScopeLeaveImpl&& other) {
+    if (this == &other) return *this;
+    this->~OnScopeLeave();
+    new (this)OnScopeLeaveImpl(std::move(other));
+    return *this;
+  }
 };
+
+// Run a function when exiting the current scope. Used like this:
+// auto on_scope_leave = OnScopeLeave([&] {
+//   // ... run some code ...
+// });
+template <typename Fn>
+inline MUST_USE_RESULT OnScopeLeaveImpl<Fn> OnScopeLeave(Fn&& fn) {
+  return OnScopeLeaveImpl<Fn>{std::move(fn)};
+}
 
 // Simple RAII wrapper for contiguous data that uses malloc()/free().
 template <typename T>
@@ -512,6 +569,11 @@ struct MallocedBuffer {
   void Truncate(size_t new_size) {
     CHECK(new_size <= size);
     size = new_size;
+  }
+
+  void Realloc(size_t new_size) {
+    Truncate(new_size);
+    data = UncheckedRealloc(data, new_size);
   }
 
   inline bool is_empty() const { return data == nullptr; }
@@ -543,6 +605,15 @@ class NonCopyableMaybe {
 
   bool IsEmpty() const {
     return empty_;
+  }
+
+  const T* get() const {
+    return empty_ ? nullptr : &value_;
+  }
+
+  const T* operator->() const {
+    CHECK(!empty_);
+    return &value_;
   }
 
   T&& Release() {
@@ -577,7 +648,7 @@ using DeleteFnPtr = typename FunctionDeleter<T, function>::Pointer;
 std::vector<std::string> SplitString(const std::string& in, char delim);
 
 inline v8::MaybeLocal<v8::Value> ToV8Value(v8::Local<v8::Context> context,
-                                           const std::string& str,
+                                           std::string_view str,
                                            v8::Isolate* isolate = nullptr);
 template <typename T, typename test_for_number =
     typename std::enable_if<std::numeric_limits<T>::is_specialized, bool>::type>
@@ -587,6 +658,10 @@ inline v8::MaybeLocal<v8::Value> ToV8Value(v8::Local<v8::Context> context,
 template <typename T>
 inline v8::MaybeLocal<v8::Value> ToV8Value(v8::Local<v8::Context> context,
                                            const std::vector<T>& vec,
+                                           v8::Isolate* isolate = nullptr);
+template <typename T>
+inline v8::MaybeLocal<v8::Value> ToV8Value(v8::Local<v8::Context> context,
+                                           const std::set<T>& set,
                                            v8::Isolate* isolate = nullptr);
 template <typename T, typename U>
 inline v8::MaybeLocal<v8::Value> ToV8Value(v8::Local<v8::Context> context,
@@ -626,11 +701,9 @@ inline v8::MaybeLocal<v8::Value> ToV8Value(v8::Local<v8::Context> context,
   do {                                                                         \
     v8::Isolate* isolate = target->GetIsolate();                               \
     v8::Local<v8::String> constant_name =                                      \
-        v8::String::NewFromUtf8(isolate, name, v8::NewStringType::kNormal)     \
-            .ToLocalChecked();                                                 \
+        v8::String::NewFromUtf8(isolate, name).ToLocalChecked();               \
     v8::Local<v8::String> constant_value =                                     \
-        v8::String::NewFromUtf8(isolate, constant, v8::NewStringType::kNormal) \
-            .ToLocalChecked();                                                 \
+        v8::String::NewFromUtf8(isolate, constant).ToLocalChecked();           \
     v8::PropertyAttribute constant_attributes =                                \
         static_cast<v8::PropertyAttribute>(v8::ReadOnly | v8::DontDelete);     \
     target                                                                     \
@@ -663,22 +736,18 @@ inline bool IsBigEndian() {
   return GetEndianness() == kBigEndian;
 }
 
-template <typename T, size_t N>
-constexpr size_t arraysize(const T (&)[N]) {
-  return N;
-}
-
 // Round up a to the next highest multiple of b.
 template <typename T>
 constexpr T RoundUp(T a, T b) {
   return a % b != 0 ? a + b - (a % b) : a;
 }
 
-#ifdef __GNUC__
-#define MUST_USE_RESULT __attribute__((warn_unused_result))
-#else
-#define MUST_USE_RESULT
-#endif
+// Align ptr to an `alignment`-bytes boundary.
+template <typename T, typename U>
+constexpr T* AlignUp(T* ptr, U alignment) {
+  return reinterpret_cast<T*>(
+      RoundUp(reinterpret_cast<uintptr_t>(ptr), alignment));
+}
 
 class SlicedArguments : public MaybeStackBuffer<v8::Local<v8::Value>> {
  public:
@@ -712,6 +781,7 @@ class PersistentToLocal {
   template <class TypeName>
   static inline v8::Local<TypeName> Strong(
       const v8::PersistentBase<TypeName>& persistent) {
+    DCHECK(!persistent.IsWeak());
     return *reinterpret_cast<v8::Local<TypeName>*>(
         const_cast<v8::PersistentBase<TypeName>*>(&persistent));
   }
@@ -724,6 +794,38 @@ class PersistentToLocal {
   }
 };
 
+// Can be used as a key for std::unordered_map when lookup performance is more
+// important than size and the keys are statically used to avoid redundant hash
+// computations.
+class FastStringKey {
+ public:
+  constexpr explicit FastStringKey(const char* name);
+
+  struct Hash {
+    constexpr size_t operator()(const FastStringKey& key) const;
+  };
+  constexpr bool operator==(const FastStringKey& other) const;
+
+  constexpr const char* c_str() const;
+
+ private:
+  static constexpr size_t HashImpl(const char* str);
+
+  const char* name_;
+  size_t cached_hash_;
+};
+
+// Like std::static_pointer_cast but for unique_ptr with the default deleter.
+template <typename T, typename U>
+std::unique_ptr<T> static_unique_pointer_cast(std::unique_ptr<U>&& ptr) {
+  return std::unique_ptr<T>(static_cast<T*>(ptr.release()));
+}
+
+#define MAYBE_FIELD_PTR(ptr, field) ptr == nullptr ? nullptr : &(ptr->field)
+
+// Returns a non-zero code if it fails to open or read the file,
+// aborts if it fails to close the file.
+int ReadFileSync(std::string* result, const char* path);
 }  // namespace node
 
 #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS

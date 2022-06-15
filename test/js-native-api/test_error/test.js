@@ -60,44 +60,45 @@ assert.throws(() => {
   test_error.throwTypeError();
 }, /^TypeError: type error$/);
 
-function testThrowArbitrary(value) {
-  assert.throws(
+assert.throws(() => {
+  test_error.throwSyntaxError();
+}, /^SyntaxError: syntax error$/);
+
+[42, {}, [], Symbol('xyzzy'), true, 'ball', undefined, null, NaN]
+  .forEach((value) => assert.throws(
     () => test_error.throwArbitrary(value),
     (err) => {
       assert.strictEqual(err, value);
       return true;
-    });
-}
+    }
+  ));
 
-testThrowArbitrary(42);
-testThrowArbitrary({});
-testThrowArbitrary([]);
-testThrowArbitrary(Symbol('xyzzy'));
-testThrowArbitrary(true);
-testThrowArbitrary('ball');
-testThrowArbitrary(undefined);
-testThrowArbitrary(null);
-testThrowArbitrary(NaN);
-
-common.expectsError(
+assert.throws(
   () => test_error.throwErrorCode(),
   {
     code: 'ERR_TEST_CODE',
     message: 'Error [error]'
   });
 
-common.expectsError(
+assert.throws(
   () => test_error.throwRangeErrorCode(),
   {
     code: 'ERR_TEST_CODE',
     message: 'RangeError [range error]'
   });
 
-common.expectsError(
+assert.throws(
   () => test_error.throwTypeErrorCode(),
   {
     code: 'ERR_TEST_CODE',
     message: 'TypeError [type error]'
+  });
+
+assert.throws(
+  () => test_error.throwSyntaxErrorCode(),
+  {
+    code: 'ERR_TEST_CODE',
+    message: 'SyntaxError [syntax error]'
   });
 
 let error = test_error.createError();
@@ -113,6 +114,11 @@ error = test_error.createTypeError();
 assert.ok(error instanceof TypeError,
           'expected error to be an instance of TypeError');
 assert.strictEqual(error.message, 'type error');
+
+error = test_error.createSyntaxError();
+assert.ok(error instanceof SyntaxError,
+          'expected error to be an instance of SyntaxError');
+assert.strictEqual(error.message, 'syntax error');
 
 error = test_error.createErrorCode();
 assert.ok(error instanceof Error, 'expected error to be an instance of Error');
@@ -133,3 +139,10 @@ assert.ok(error instanceof TypeError,
 assert.strictEqual(error.message, 'TypeError [type error]');
 assert.strictEqual(error.code, 'ERR_TEST_CODE');
 assert.strictEqual(error.name, 'TypeError');
+
+error = test_error.createSyntaxErrorCode();
+assert.ok(error instanceof SyntaxError,
+          'expected error to be an instance of SyntaxError');
+assert.strictEqual(error.message, 'SyntaxError [syntax error]');
+assert.strictEqual(error.code, 'ERR_TEST_CODE');
+assert.strictEqual(error.name, 'SyntaxError');

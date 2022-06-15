@@ -2,18 +2,46 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <algorithm>
+#include "src/torque/implementation-visitor.h"
 
-#include "src/globals.h"
+#include <algorithm>
+#include <iomanip>
+#include <string>
+
+#include "src/base/optional.h"
+#include "src/common/globals.h"
+#include "src/numbers/integer-literal-inl.h"
+#include "src/torque/cc-generator.h"
+#include "src/torque/cfg.h"
+#include "src/torque/constants.h"
+#include "src/torque/cpp-builder.h"
 #include "src/torque/csa-generator.h"
 #include "src/torque/declaration-visitor.h"
-#include "src/torque/implementation-visitor.h"
+#include "src/torque/global-context.h"
+#include "src/torque/kythe-data.h"
 #include "src/torque/parameter-difference.h"
 #include "src/torque/server-data.h"
+#include "src/torque/source-positions.h"
+#include "src/torque/type-inference.h"
+#include "src/torque/type-visitor.h"
+#include "src/torque/types.h"
+#include "src/torque/utils.h"
 
 namespace v8 {
 namespace internal {
 namespace torque {
+
+uint64_t next_unique_binding_index = 0;
+
+// Sadly, 'using std::string_literals::operator""s;' is bugged in MSVC (see
+// https://developercommunity.visualstudio.com/t/Incorrect-warning-when-using-standard-st/673948).
+// TODO(nicohartmann@): Change to 'using std::string_literals::operator""s;'
+// once this is fixed.
+using namespace std::string_literals;  // NOLINT(build/namespaces)
+
+namespace {
+const char* BuiltinIncludesMarker = "// __BUILTIN_INCLUDES_MARKER__\n";
+}  // namespace
 
 VisitResult ImplementationVisitor::Visit(Expression* expr) {
   CurrentSourcePosition::Scope scope(expr->pos);
@@ -47,180 +75,206 @@ const Type* ImplementationVisitor::Visit(Statement* stmt) {
   return result;
 }
 
-void ImplementationVisitor::BeginNamespaceFile(Namespace* nspace) {
-  std::ostream& source = nspace->source_stream();
-  std::ostream& header = nspace->header_stream();
-
-  for (const std::string& include_path : GlobalContext::CppIncludes()) {
-    source << "#include " << StringLiteralQuote(include_path) << "\n";
+void ImplementationVisitor::BeginGeneratedFiles() {
+  std::set<SourceId> contains_class_definitions;
+  for (const ClassType* type : TypeOracle::GetClasses()) {
+    if (type->ShouldGenerateCppClassDefinitions()) {
+      contains_class_definitions.insert(type->AttributedToFile());
+    }
   }
 
-  for (Namespace* n : GlobalContext::Get().GetNamespaces()) {
-    source << "#include \"torque-generated/builtins-" +
-                  DashifyString(n->name()) + "-from-dsl-gen.h\"\n";
+  for (SourceId source : SourceFileMap::AllSources()) {
+    auto& streams = GlobalContext::GeneratedPerFile(source);
+    // Output beginning of CSA .cc file.
+    {
+      cpp::File& file = streams.csa_cc;
+
+      for (const std::string& include_path : GlobalContext::CppIncludes()) {
+        file << "#include " << StringLiteralQuote(include_path) << "\n";
+      }
+
+      file << "// Required Builtins:\n";
+      file << "#include \"torque-generated/" +
+                  SourceFileMap::PathFromV8RootWithoutExtension(source) +
+                  "-tq-csa.h\"\n";
+      // Now that required include files are collected while generting the file,
+      // we only know the full set at the end. Insert a marker here that is
+      // replaced with the list of includes at the very end.
+      // TODO(nicohartmann@): This is not the most beautiful way to do this,
+      // replace once the cpp file builder is available, where this can be
+      // handled easily.
+      file << BuiltinIncludesMarker;
+      file << "\n";
+
+      streams.csa_cc.BeginNamespace("v8", "internal");
+      streams.csa_ccfile << "\n";
+    }
+    // Output beginning of CSA .h file.
+    {
+      cpp::File& file = streams.csa_header;
+      std::string header_define =
+          "V8_GEN_TORQUE_GENERATED_" +
+          UnderlinifyPath(SourceFileMap::PathFromV8Root(source)) + "_CSA_H_";
+      streams.csa_header.BeginIncludeGuard(header_define);
+      file << "#include \"src/builtins/torque-csa-header-includes.h\"\n";
+      file << "\n";
+
+      streams.csa_header.BeginNamespace("v8", "internal");
+      streams.csa_headerfile << "\n";
+    }
+    // Output beginning of class definition .cc file.
+    {
+      cpp::File& file = streams.class_definition_cc;
+      if (contains_class_definitions.count(source) != 0) {
+        file << "#include \""
+             << SourceFileMap::PathFromV8RootWithoutExtension(source)
+             << "-inl.h\"\n\n";
+        file << "#include \"torque-generated/class-verifiers.h\"\n";
+        file << "#include \"src/objects/instance-type-inl.h\"\n\n";
+      }
+
+      streams.class_definition_cc.BeginNamespace("v8", "internal");
+      streams.class_definition_ccfile << "\n";
+    }
   }
+}
+
+void ImplementationVisitor::EndGeneratedFiles() {
+  for (SourceId file : SourceFileMap::AllSources()) {
+    auto& streams = GlobalContext::GeneratedPerFile(file);
+
+    // Output ending of CSA .cc file.
+    streams.csa_cc.EndNamespace("v8", "internal");
+
+    // Output ending of CSA .h file.
+    {
+      std::string header_define =
+          "V8_GEN_TORQUE_GENERATED_" +
+          UnderlinifyPath(SourceFileMap::PathFromV8Root(file)) + "_CSA_H_";
+
+      streams.csa_header.EndNamespace("v8", "internal");
+      streams.csa_headerfile << "\n";
+      streams.csa_header.EndIncludeGuard(header_define);
+    }
+
+    // Output ending of class definition .cc file.
+    streams.class_definition_cc.EndNamespace("v8", "internal");
+  }
+}
+
+void ImplementationVisitor::BeginDebugMacrosFile() {
+  // TODO(torque-builer): Can use builder for debug_macros_*_
+  std::ostream& source = debug_macros_cc_;
+  std::ostream& header = debug_macros_h_;
+
+  source << "#include \"torque-generated/debug-macros.h\"\n\n";
+  source << "#include \"src/objects/swiss-name-dictionary.h\"\n";
+  source << "#include \"src/objects/ordered-hash-table.h\"\n";
+  source << "#include \"tools/debug_helper/debug-macro-shims.h\"\n";
+  source << "#include \"include/v8-internal.h\"\n";
   source << "\n";
 
   source << "namespace v8 {\n"
          << "namespace internal {\n"
+         << "namespace debug_helper_internal {\n"
          << "\n";
 
-  std::string upper_name(nspace->name());
-  transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
-            ::toupper);
-  std::string headerDefine =
-      std::string("V8_TORQUE_") + upper_name + "_FROM_DSL_BASE_H__";
-  header << "#ifndef " << headerDefine << "\n";
-  header << "#define " << headerDefine << "\n\n";
-  header << "#include \"src/compiler/code-assembler.h\"\n";
-  if (nspace != GlobalContext::GetDefaultNamespace()) {
-    header << "#include \"src/code-stub-assembler.h\"\n";
-  }
-  header << "#include \"src/utils.h\"\n";
-  header << "#include \"torque-generated/class-definitions-from-dsl.h\"\n";
+  const char* kHeaderDefine = "V8_GEN_TORQUE_GENERATED_DEBUG_MACROS_H_";
+  header << "#ifndef " << kHeaderDefine << "\n";
+  header << "#define " << kHeaderDefine << "\n\n";
+  header << "#include \"tools/debug_helper/debug-helper-internal.h\"\n";
+  header << "#include \"src/numbers/integer-literal.h\"\n";
   header << "\n";
 
   header << "namespace v8 {\n"
          << "namespace internal {\n"
+         << "namespace debug_helper_internal {\n"
          << "\n";
-
-  header << "class ";
-  if (nspace->IsTestNamespace()) {
-    header << "V8_EXPORT_PRIVATE ";
-  }
-  header << nspace->ExternalName() << " {\n";
-  header << " public:\n";
-  header << "  explicit " << nspace->ExternalName()
-         << "(compiler::CodeAssemblerState* state) : state_(state), ca_(state) "
-            "{ USE(state_, ca_); }\n";
 }
 
-void ImplementationVisitor::EndNamespaceFile(Namespace* nspace) {
-  std::ostream& source = nspace->source_stream();
-  std::ostream& header = nspace->header_stream();
-
-  std::string upper_name(nspace->name());
-  transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
-            ::toupper);
-  std::string headerDefine =
-      std::string("V8_TORQUE_") + upper_name + "_FROM_DSL_BASE_H__";
+void ImplementationVisitor::EndDebugMacrosFile() {
+  // TODO(torque-builder): Can use builder for debug_macros_*_
+  std::ostream& source = debug_macros_cc_;
+  std::ostream& header = debug_macros_h_;
 
   source << "}  // namespace internal\n"
          << "}  // namespace v8\n"
+         << "}  // namespace debug_helper_internal\n"
          << "\n";
 
-  header << " private:\n"
-         << "  compiler::CodeAssemblerState* const state_;\n"
-         << "  compiler::CodeAssembler ca_;\n"
-         << "};\n\n";
-  header << "}  // namespace internal\n"
+  header << "\n}  // namespace internal\n"
          << "}  // namespace v8\n"
+         << "}  // namespace debug_helper_internal\n"
          << "\n";
-  header << "#endif  // " << headerDefine << "\n";
+  header << "#endif  // V8_GEN_TORQUE_GENERATED_DEBUG_MACROS_H_\n";
 }
 
 void ImplementationVisitor::Visit(NamespaceConstant* decl) {
-  Signature signature{{}, base::nullopt, {{}, false}, 0, decl->type(), {}};
-  const std::string& name = decl->name()->value;
+  Signature signature{{}, base::nullopt, {{}, false}, 0, decl->type(),
+                      {}, false};
 
   BindingsManagersScope bindings_managers_scope;
 
-  header_out() << "  ";
-  GenerateFunctionDeclaration(header_out(), "", name, signature, {});
-  header_out() << ";\n";
+  cpp::Function f =
+      GenerateFunction(nullptr, decl->external_name(), signature, {});
 
-  GenerateFunctionDeclaration(source_out(),
-                              CurrentNamespace()->ExternalName() + "::", name,
-                              signature, {});
-  source_out() << " {\n";
+  f.PrintDeclaration(csa_headerfile());
 
-  DCHECK(!signature.return_type->IsVoidOrNever());
+  f.PrintDefinition(csa_ccfile(), [&](std::ostream& stream) {
+    stream << "  compiler::CodeAssembler ca_(state_);\n";
 
-  assembler_ = CfgAssembler(Stack<const Type*>{});
+    DCHECK(!signature.return_type->IsVoidOrNever());
 
-  VisitResult expression_result = Visit(decl->body());
-  VisitResult return_result =
-      GenerateImplicitConvert(signature.return_type, expression_result);
+    assembler_ = CfgAssembler(Stack<const Type*>{});
 
-  CSAGenerator csa_generator{assembler().Result(), source_out()};
-  Stack<std::string> values = *csa_generator.EmitGraph(Stack<std::string>{});
+    VisitResult expression_result = Visit(decl->body());
+    VisitResult return_result =
+        GenerateImplicitConvert(signature.return_type, expression_result);
 
-  assembler_ = base::nullopt;
+    CSAGenerator csa_generator{assembler().Result(), stream};
+    Stack<std::string> values = *csa_generator.EmitGraph(Stack<std::string>{});
 
-  source_out() << "return ";
-  CSAGenerator::EmitCSAValue(return_result, values, source_out());
-  source_out() << ";\n";
-  source_out() << "}\n\n";
+    assembler_ = base::nullopt;
+
+    stream << "  return ";
+    CSAGenerator::EmitCSAValue(return_result, values, stream);
+    stream << ";";
+  });
 }
 
 void ImplementationVisitor::Visit(TypeAlias* alias) {
   if (alias->IsRedeclaration()) return;
-  const ClassType* class_type = ClassType::DynamicCast(alias->type());
-  if (class_type && class_type->IsExtern()) {
-    // Classes that are in the default namespace are defined in the C++
-    // world and all of their fields and methods are declared explicitly.
-    // Internal classes (e.g. ones used for testing that are not in the default
-    // name space) need to be defined by Torque.
-    // TODO(danno): This is a pretty cheesy hack for now. There should be a more
-    // robust mechanism for this, e.g. declaring classes 'extern' or something.
-    if (class_type->nspace()->IsTestNamespace()) {
-      std::string class_name{
-          class_type->GetSuperClass()->GetGeneratedTNodeTypeName()};
-      header_out() << "  class " << class_type->name() << " : public "
-                   << class_name << " {\n";
-      header_out() << "   public:\n";
-      header_out() << "    DEFINE_FIELD_OFFSET_CONSTANTS(" << class_name
-                   << "::kSize, TORQUE_GENERATED_"
-                   << CapifyStringWithUnderscores(class_type->name())
-                   << "_FIELDS)\n";
-      header_out() << "  };\n";
-    } else if (!class_type->nspace()->IsDefaultNamespace()) {
-      ReportError(
-          "extern classes are currently only supported in the default and test "
-          "namespaces");
-    }
-    return;
-  }
-  const StructType* struct_type = StructType::DynamicCast(alias->type());
-  if (!struct_type) return;
-  const std::string& name = struct_type->name();
-  header_out() << "  struct " << name << " {\n";
-  for (auto& field : struct_type->fields()) {
-    header_out() << "    " << field.name_and_type.type->GetGeneratedTypeName();
-    header_out() << " " << field.name_and_type.name << ";\n";
-  }
-  header_out() << "\n    std::tuple<";
-  bool first = true;
-  for (const Type* type : LowerType(struct_type)) {
-    if (!first) {
-      header_out() << ", ";
-    }
-    first = false;
-    header_out() << type->GetGeneratedTypeName();
-  }
-  header_out() << "> Flatten() const {\n"
-               << "      return std::tuple_cat(";
-  first = true;
-  for (auto& field : struct_type->fields()) {
-    if (!first) {
-      header_out() << ", ";
-    }
-    first = false;
-    if (field.name_and_type.type->IsStructType()) {
-      header_out() << field.name_and_type.name << ".Flatten()";
-    } else {
-      header_out() << "std::make_tuple(" << field.name_and_type.name << ")";
+  if (const ClassType* class_type = ClassType::DynamicCast(alias->type())) {
+    if (class_type->IsExtern() && !class_type->nspace()->IsDefaultNamespace()) {
+      Error(
+          "extern classes are currently only supported in the default "
+          "namespace");
     }
   }
-  header_out() << ");\n";
-  header_out() << "    }\n";
-  header_out() << "  };\n";
 }
+
+class ImplementationVisitor::MacroInliningScope {
+ public:
+  MacroInliningScope(ImplementationVisitor* visitor, const Macro* macro)
+      : visitor_(visitor), macro_(macro) {
+    if (!visitor_->inlining_macros_.insert(macro).second) {
+      // Recursive macro expansion would just keep going until stack overflow.
+      // To avoid crashes, throw an error immediately.
+      ReportError("Recursive macro call to ", *macro);
+    }
+  }
+  ~MacroInliningScope() { visitor_->inlining_macros_.erase(macro_); }
+
+ private:
+  ImplementationVisitor* visitor_;
+  const Macro* macro_;
+};
 
 VisitResult ImplementationVisitor::InlineMacro(
     Macro* macro, base::Optional<LocationReference> this_reference,
     const std::vector<VisitResult>& arguments,
     const std::vector<Block*> label_blocks) {
+  MacroInliningScope macro_inlining_scope(this, macro);
   CurrentScope::Scope current_scope(macro);
   BindingsManagersScope bindings_managers_scope;
   CurrentCallable::Scope current_callable(macro);
@@ -244,23 +298,35 @@ VisitResult ImplementationVisitor::InlineMacro(
   // than read operations.
   if (this_reference) {
     DCHECK(macro->IsMethod());
-    LocalValue this_value = LocalValue{!this_reference->IsVariableAccess(),
-                                       this_reference->GetVisitResult()};
-    parameter_bindings.Add(kThisParameterName, this_value);
+    parameter_bindings.Add(kThisParameterName, LocalValue{*this_reference},
+                           true);
+    // TODO(v8:12261): Tracking 'this'-binding for kythe led to a few weird
+    // issues. Review to fully support 'this' in methods.
   }
 
-  size_t i = 0;
+  size_t count = 0;
   for (auto arg : arguments) {
-    if (this_reference && i == signature.implicit_count) i++;
-    const Identifier* name = macro->parameter_names()[i++];
-    parameter_bindings.Add(name, LocalValue{true, arg});
+    if (this_reference && count == signature.implicit_count) count++;
+    const bool mark_as_used = signature.implicit_count > count;
+    const Identifier* name = macro->parameter_names()[count++];
+    Binding<LocalValue>* binding =
+        parameter_bindings.Add(name,
+                               LocalValue{LocationReference::Temporary(
+                                   arg, "parameter " + name->value)},
+                               mark_as_used);
+    if (GlobalContext::collect_kythe_data()) {
+      KytheData::AddBindingDefinition(binding);
+    }
   }
 
   DCHECK_EQ(label_blocks.size(), signature.labels.size());
   for (size_t i = 0; i < signature.labels.size(); ++i) {
     const LabelDeclaration& label_info = signature.labels[i];
-    label_bindings.Add(label_info.name,
-                       LocalLabel{label_blocks[i], label_info.types});
+    Binding<LocalLabel>* binding = label_bindings.Add(
+        label_info.name, LocalLabel{label_blocks[i], label_info.types});
+    if (GlobalContext::collect_kythe_data()) {
+      KytheData::AddBindingDefinition(binding);
+    }
   }
 
   Block* macro_end;
@@ -284,7 +350,7 @@ VisitResult ImplementationVisitor::InlineMacro(
       }
     }
     macro_end = assembler().NewBlock(std::move(stack));
-    macro_end_binding.emplace(&LabelBindingsManager::Get(), "_macro_end",
+    macro_end_binding.emplace(&LabelBindingsManager::Get(), kMacroEndLabelName,
                               LocalLabel{macro_end, {return_type}});
   } else {
     SetReturnValue(VisitResult::NeverResult());
@@ -332,13 +398,34 @@ void ImplementationVisitor::VisitMacroCommon(Macro* macro) {
   bool has_return_value =
       can_return && return_type != TypeOracle::GetVoidType();
 
-  header_out() << "  ";
-  GenerateMacroFunctionDeclaration(header_out(), "", macro);
-  header_out() << ";\n";
+  cpp::Function f = GenerateMacroFunctionDeclaration(macro);
+  f.PrintDeclaration(csa_headerfile());
+  csa_headerfile() << "\n";
 
-  GenerateMacroFunctionDeclaration(
-      source_out(), CurrentNamespace()->ExternalName() + "::", macro);
-  source_out() << " {\n";
+  cpp::File csa_cc(csa_ccfile());
+
+  // Avoid multiple-definition errors since it is possible for multiple
+  // generated -inl.inc files to all contain function definitions for the same
+  // Torque macro.
+  base::Optional<cpp::IncludeGuardScope> include_guard;
+  if (output_type_ == OutputType::kCC) {
+    include_guard.emplace(&csa_cc, "V8_INTERNAL_DEFINED_"s + macro->CCName());
+  } else if (output_type_ == OutputType::kCCDebug) {
+    include_guard.emplace(&csa_cc,
+                          "V8_INTERNAL_DEFINED_"s + macro->CCDebugName());
+  }
+
+  f.PrintBeginDefinition(csa_ccfile());
+
+  if (output_type_ == OutputType::kCC) {
+    // For now, generated C++ is only for field offset computations. If we ever
+    // generate C++ code that can allocate, then it should be handlified.
+    csa_ccfile() << "  DisallowGarbageCollection no_gc;\n";
+  } else if (output_type_ == OutputType::kCSA) {
+    csa_ccfile() << "  compiler::CodeAssembler ca_(state_);\n";
+    csa_ccfile()
+        << "  compiler::CodeAssembler::SourcePositionScope pos_scope(&ca_);\n";
+  }
 
   Stack<std::string> lowered_parameters;
   Stack<const Type*> lowered_parameter_types;
@@ -407,35 +494,52 @@ void ImplementationVisitor::VisitMacroCommon(Macro* macro) {
     const LabelDeclaration& label_info = signature.labels[i];
     assembler().Bind(label_block);
     std::vector<std::string> label_parameter_variables;
-    for (size_t i = 0; i < label_info.types.size(); ++i) {
-      LowerLabelParameter(label_info.types[i],
-                          ExternalLabelParameterName(label_info.name, i),
+    for (size_t j = 0; j < label_info.types.size(); ++j) {
+      LowerLabelParameter(label_info.types[j],
+                          ExternalLabelParameterName(label_info.name->value, j),
                           &label_parameter_variables);
     }
-    assembler().Emit(GotoExternalInstruction{ExternalLabelName(label_info.name),
-                                             label_parameter_variables});
+    assembler().Emit(GotoExternalInstruction{
+        ExternalLabelName(label_info.name->value), label_parameter_variables});
   }
 
   if (return_type != TypeOracle::GetNeverType()) {
     assembler().Bind(end);
   }
 
-  CSAGenerator csa_generator{assembler().Result(), source_out()};
-  base::Optional<Stack<std::string>> values =
-      csa_generator.EmitGraph(lowered_parameters);
+  base::Optional<Stack<std::string>> values;
+  if (output_type_ == OutputType::kCC) {
+    CCGenerator cc_generator{assembler().Result(), csa_ccfile()};
+    values = cc_generator.EmitGraph(lowered_parameters);
+  } else if (output_type_ == OutputType::kCCDebug) {
+    CCGenerator cc_generator{assembler().Result(), csa_ccfile(), true};
+    values = cc_generator.EmitGraph(lowered_parameters);
+  } else {
+    CSAGenerator csa_generator{assembler().Result(), csa_ccfile()};
+    values = csa_generator.EmitGraph(lowered_parameters);
+  }
 
   assembler_ = base::nullopt;
 
   if (has_return_value) {
-    source_out() << "  return ";
-    CSAGenerator::EmitCSAValue(return_value, *values, source_out());
-    source_out() << ";\n";
+    csa_ccfile() << "  return ";
+    if (output_type_ == OutputType::kCCDebug) {
+      csa_ccfile() << "{d::MemoryAccessResult::kOk, ";
+      CCGenerator::EmitCCValue(return_value, *values, csa_ccfile());
+      csa_ccfile() << "}";
+    } else if (output_type_ == OutputType::kCC) {
+      CCGenerator::EmitCCValue(return_value, *values, csa_ccfile());
+    } else {
+      CSAGenerator::EmitCSAValue(return_value, *values, csa_ccfile());
+    }
+    csa_ccfile() << ";\n";
   }
-  source_out() << "}\n\n";
+  f.PrintEndDefinition(csa_ccfile());
+
+  include_guard.reset();
 }
 
-void ImplementationVisitor::Visit(Macro* macro) {
-  if (macro->IsExternal()) return;
+void ImplementationVisitor::Visit(TorqueMacro* macro) {
   VisitMacroCommon(macro);
 }
 
@@ -449,13 +553,21 @@ namespace {
 std::string AddParameter(size_t i, Builtin* builtin,
                          Stack<std::string>* parameters,
                          Stack<const Type*>* parameter_types,
-                         BlockBindings<LocalValue>* parameter_bindings) {
+                         BlockBindings<LocalValue>* parameter_bindings,
+                         bool mark_as_used) {
   const Identifier* name = builtin->signature().parameter_names[i];
   const Type* type = builtin->signature().types()[i];
   std::string external_name = "parameter" + std::to_string(i);
   parameters->Push(external_name);
   StackRange range = parameter_types->PushMany(LowerType(type));
-  parameter_bindings->Add(name, LocalValue{true, VisitResult(type, range)});
+  Binding<LocalValue>* binding = parameter_bindings->Add(
+      name,
+      LocalValue{LocationReference::Temporary(VisitResult(type, range),
+                                              "parameter " + name->value)},
+      mark_as_used);
+  if (GlobalContext::collect_kythe_data()) {
+    KytheData::AddBindingDefinition(binding);
+  }
   return external_name;
 }
 
@@ -464,14 +576,14 @@ std::string AddParameter(size_t i, Builtin* builtin,
 void ImplementationVisitor::Visit(Builtin* builtin) {
   if (builtin->IsExternal()) return;
   CurrentScope::Scope current_scope(builtin);
-  const std::string& name = builtin->ExternalName();
-  const Signature& signature = builtin->signature();
-  source_out() << "TF_BUILTIN(" << name << ", CodeStubAssembler) {\n"
-               << "  compiler::CodeAssemblerState* state_ = state();"
-               << "  compiler::CodeAssembler ca_(state());\n";
-
   CurrentCallable::Scope current_callable(builtin);
   CurrentReturnValue::Scope current_return_value;
+
+  const std::string& name = builtin->ExternalName();
+  const Signature& signature = builtin->signature();
+  csa_ccfile() << "TF_BUILTIN(" << name << ", CodeStubAssembler) {\n"
+               << "  compiler::CodeAssemblerState* state_ = state();"
+               << "  compiler::CodeAssembler ca_(state());\n";
 
   Stack<const Type*> parameter_types;
   Stack<std::string> parameters;
@@ -480,68 +592,136 @@ void ImplementationVisitor::Visit(Builtin* builtin) {
 
   BlockBindings<LocalValue> parameter_bindings(&ValueBindingsManager::Get());
 
-  // Context
-  std::string parameter0 = AddParameter(0, builtin, &parameters,
-                                        &parameter_types, &parameter_bindings);
-  source_out() << "  TNode<Context> " << parameter0
-               << " = UncheckedCast<Context>(Parameter("
-               << "Descriptor::kContext));\n";
-  source_out() << "  USE(" << parameter0 << ");\n";
+  if (builtin->IsVarArgsJavaScript() || builtin->IsFixedArgsJavaScript()) {
+    if (builtin->IsVarArgsJavaScript()) {
+      DCHECK(signature.parameter_types.var_args);
+      if (signature.ExplicitCount() > 0) {
+        Error("Cannot mix explicit parameters with varargs.")
+            .Position(signature.parameter_names[signature.implicit_count]->pos);
+      }
 
-  size_t first = 1;
-  if (builtin->IsVarArgsJavaScript()) {
-    DCHECK(signature.parameter_types.var_args);
-    source_out()
-        << "  Node* argc = Parameter(Descriptor::kJSActualArgumentsCount);\n";
-    std::string parameter1 = AddParameter(
-        1, builtin, &parameters, &parameter_types, &parameter_bindings);
-    source_out()
-        << "  TNode<IntPtrT> arguments_length(ChangeInt32ToIntPtr(argc));\n";
-    source_out() << "  TNode<RawPtrT> arguments_frame = "
-                    "UncheckedCast<RawPtrT>(LoadFramePointer());\n";
-    source_out() << "  BaseBuiltinsFromDSLAssembler::Arguments "
-                    "torque_arguments(GetFrameArguments(arguments_frame, "
-                    "arguments_length));\n";
-    source_out() << "  CodeStubArguments arguments(this, torque_arguments);\n";
+      csa_ccfile() << "  TNode<Word32T> argc = UncheckedParameter<Word32T>("
+                   << "Descriptor::kJSActualArgumentsCount);\n";
+      csa_ccfile() << "  TNode<IntPtrT> "
+                      "arguments_length(ChangeInt32ToIntPtr(UncheckedCast<"
+                      "Int32T>(argc)));\n";
+      csa_ccfile() << "  TNode<RawPtrT> arguments_frame = "
+                      "UncheckedCast<RawPtrT>(LoadFramePointer());\n";
+      csa_ccfile()
+          << "  TorqueStructArguments "
+             "torque_arguments(GetFrameArguments(arguments_frame, "
+             "arguments_length, FrameArgumentsArgcType::kCountIncludesReceiver"
+          << "));\n";
+      csa_ccfile()
+          << "  CodeStubArguments arguments(this, torque_arguments);\n";
 
-    source_out() << "  TNode<Object> " << parameter1
-                 << " = arguments.GetReceiver();\n";
-    source_out() << "USE(" << parameter1 << ");\n";
-    parameters.Push("torque_arguments.frame");
-    parameters.Push("torque_arguments.base");
-    parameters.Push("torque_arguments.length");
-    const Type* arguments_type = TypeOracle::GetArgumentsType();
-    StackRange range = parameter_types.PushMany(LowerType(arguments_type));
-    parameter_bindings.Add(
-        *signature.arguments_variable,
-        LocalValue{true, VisitResult(arguments_type, range)});
+      parameters.Push("torque_arguments.frame");
+      parameters.Push("torque_arguments.base");
+      parameters.Push("torque_arguments.length");
+      parameters.Push("torque_arguments.actual_count");
+      const Type* arguments_type = TypeOracle::GetArgumentsType();
+      StackRange range = parameter_types.PushMany(LowerType(arguments_type));
+      parameter_bindings.Add(*signature.arguments_variable,
+                             LocalValue{LocationReference::Temporary(
+                                 VisitResult(arguments_type, range),
+                                 "parameter " + *signature.arguments_variable)},
+                             true);
+    }
 
-    first = 2;
+    for (size_t i = 0; i < signature.implicit_count; ++i) {
+      const std::string& param_name = signature.parameter_names[i]->value;
+      SourcePosition param_pos = signature.parameter_names[i]->pos;
+      std::string generated_name = AddParameter(
+          i, builtin, &parameters, &parameter_types, &parameter_bindings, true);
+      const Type* actual_type = signature.parameter_types.types[i];
+      std::vector<const Type*> expected_types;
+      if (param_name == "context") {
+        csa_ccfile() << "  TNode<NativeContext> " << generated_name
+                     << " = UncheckedParameter<NativeContext>("
+                     << "Descriptor::kContext);\n";
+        csa_ccfile() << "  USE(" << generated_name << ");\n";
+        expected_types = {TypeOracle::GetNativeContextType(),
+                          TypeOracle::GetContextType()};
+      } else if (param_name == "receiver") {
+        csa_ccfile()
+            << "  TNode<Object> " << generated_name << " = "
+            << (builtin->IsVarArgsJavaScript()
+                    ? "arguments.GetReceiver()"
+                    : "UncheckedParameter<Object>(Descriptor::kReceiver)")
+            << ";\n";
+        csa_ccfile() << "  USE(" << generated_name << ");\n";
+        expected_types = {TypeOracle::GetJSAnyType()};
+      } else if (param_name == "newTarget") {
+        csa_ccfile() << "  TNode<Object> " << generated_name
+                     << " = UncheckedParameter<Object>("
+                     << "Descriptor::kJSNewTarget);\n";
+        csa_ccfile() << "USE(" << generated_name << ");\n";
+        expected_types = {TypeOracle::GetJSAnyType()};
+      } else if (param_name == "target") {
+        csa_ccfile() << "  TNode<JSFunction> " << generated_name
+                     << " = UncheckedParameter<JSFunction>("
+                     << "Descriptor::kJSTarget);\n";
+        csa_ccfile() << "USE(" << generated_name << ");\n";
+        expected_types = {TypeOracle::GetJSFunctionType()};
+      } else {
+        Error(
+            "Unexpected implicit parameter \"", param_name,
+            "\" for JavaScript calling convention, "
+            "expected \"context\", \"receiver\", \"target\", or \"newTarget\"")
+            .Position(param_pos);
+        expected_types = {actual_type};
+      }
+      if (std::find(expected_types.begin(), expected_types.end(),
+                    actual_type) == expected_types.end()) {
+        Error("According to JavaScript calling convention, expected parameter ",
+              param_name, " to have type ", PrintList(expected_types, " or "),
+              " but found type ", *actual_type)
+            .Position(param_pos);
+      }
+    }
+
+    for (size_t i = signature.implicit_count;
+         i < signature.parameter_names.size(); ++i) {
+      const std::string& parameter_name = signature.parameter_names[i]->value;
+      const Type* type = signature.types()[i];
+      const bool mark_as_used = signature.implicit_count > i;
+      std::string var = AddParameter(i, builtin, &parameters, &parameter_types,
+                                     &parameter_bindings, mark_as_used);
+      csa_ccfile() << "  " << type->GetGeneratedTypeName() << " " << var
+                   << " = "
+                   << "UncheckedParameter<" << type->GetGeneratedTNodeTypeName()
+                   << ">(Descriptor::k" << CamelifyString(parameter_name)
+                   << ");\n";
+      csa_ccfile() << "  USE(" << var << ");\n";
+    }
+
+  } else {
+    DCHECK(builtin->IsStub());
+
+    for (size_t i = 0; i < signature.parameter_names.size(); ++i) {
+      const std::string& parameter_name = signature.parameter_names[i]->value;
+      const Type* type = signature.types()[i];
+      const bool mark_as_used = signature.implicit_count > i;
+      std::string var = AddParameter(i, builtin, &parameters, &parameter_types,
+                                     &parameter_bindings, mark_as_used);
+      csa_ccfile() << "  " << type->GetGeneratedTypeName() << " " << var
+                   << " = "
+                   << "UncheckedParameter<" << type->GetGeneratedTNodeTypeName()
+                   << ">(Descriptor::k" << CamelifyString(parameter_name)
+                   << ");\n";
+      csa_ccfile() << "  USE(" << var << ");\n";
+    }
   }
-
-  for (size_t i = 0; i < signature.parameter_names.size(); ++i) {
-    if (i < first) continue;
-    const std::string& parameter_name = signature.parameter_names[i]->value;
-    const Type* type = signature.types()[i];
-    std::string var = AddParameter(i, builtin, &parameters, &parameter_types,
-                                   &parameter_bindings);
-    source_out() << "  " << type->GetGeneratedTypeName() << " " << var << " = "
-                 << "UncheckedCast<" << type->GetGeneratedTNodeTypeName()
-                 << ">(Parameter(Descriptor::k"
-                 << CamelifyString(parameter_name) << "));\n";
-    source_out() << "  USE(" << var << ");\n";
-  }
-
   assembler_ = CfgAssembler(parameter_types);
   const Type* body_result = Visit(*builtin->body());
   if (body_result != TypeOracle::GetNeverType()) {
     ReportError("control reaches end of builtin, expected return of a value");
   }
-  CSAGenerator csa_generator{assembler().Result(), source_out(),
+  CSAGenerator csa_generator{assembler().Result(), csa_ccfile(),
                              builtin->kind()};
   csa_generator.EmitGraph(parameters);
   assembler_ = base::nullopt;
-  source_out() << "}\n\n";
+  csa_ccfile() << "}\n\n";
 }
 
 const Type* ImplementationVisitor::Visit(VarDeclarationStatement* stmt) {
@@ -558,11 +738,7 @@ const Type* ImplementationVisitor::Visit(
 
   base::Optional<const Type*> type;
   if (stmt->type) {
-    type = Declarations::GetType(*stmt->type);
-    if ((*type)->IsConstexpr() && !stmt->const_qualified) {
-      ReportError(
-          "cannot declare variable with constexpr type. Use 'const' instead.");
-    }
+    type = TypeVisitor::ComputeType(*stmt->type);
   }
   base::Optional<VisitResult> init_result;
   if (stmt->initializer) {
@@ -571,6 +747,13 @@ const Type* ImplementationVisitor::Visit(
     if (type) {
       init_result = GenerateImplicitConvert(*type, *init_result);
     }
+    type = init_result->type();
+    if ((*type)->IsConstexpr() && !stmt->const_qualified) {
+      Error("Use 'const' instead of 'let' for variable '", stmt->name->value,
+            "' of constexpr type '", (*type)->ToString(), "'.")
+          .Position(stmt->name->pos)
+          .Throw();
+    }
     init_result = scope.Yield(*init_result);
   } else {
     DCHECK(type.has_value());
@@ -578,18 +761,21 @@ const Type* ImplementationVisitor::Visit(
       ReportError("constexpr variables need an initializer");
     }
     TypeVector lowered_types = LowerType(*type);
-    for (const Type* type : lowered_types) {
+    for (const Type* t : lowered_types) {
       assembler().Emit(PushUninitializedInstruction{TypeOracle::GetTopType(
           "uninitialized variable '" + stmt->name->value + "' of type " +
-              type->ToString() + " originally defined at " +
+              t->ToString() + " originally defined at " +
               PositionAsString(stmt->pos),
-          type)});
+          t)});
     }
     init_result =
         VisitResult(*type, assembler().TopRange(lowered_types.size()));
   }
-  block_bindings->Add(stmt->name,
-                      LocalValue{stmt->const_qualified, *init_result});
+  LocationReference ref = stmt->const_qualified
+                              ? LocationReference::Temporary(
+                                    *init_result, "const " + stmt->name->value)
+                              : LocationReference::VariableAccess(*init_result);
+  block_bindings->Add(stmt->name, LocalValue{std::move(ref)});
   return TypeOracle::GetVoidType();
 }
 
@@ -638,24 +824,8 @@ VisitResult ImplementationVisitor::Visit(ConditionalExpression* expr) {
 }
 
 VisitResult ImplementationVisitor::Visit(LogicalOrExpression* expr) {
-  VisitResult left_result;
-  {
-    Block* false_block = assembler().NewBlock(assembler().CurrentStack());
-    Binding<LocalLabel> false_binding{&LabelBindingsManager::Get(),
-                                      kFalseLabelName, LocalLabel{false_block}};
-    left_result = Visit(expr->left);
-    if (left_result.type()->IsBool()) {
-      Block* true_block = LookupSimpleLabel(kTrueLabelName);
-      assembler().Branch(true_block, false_block);
-      assembler().Bind(false_block);
-    } else if (left_result.type()->IsNever()) {
-      assembler().Bind(false_block);
-    } else if (!left_result.type()->IsConstexprBool()) {
-      ReportError(
-          "expected type bool, constexpr bool, or never on left-hand side of "
-          "operator ||");
-    }
-  }
+  StackScope outer_scope(this);
+  VisitResult left_result = Visit(expr->left);
 
   if (left_result.type()->IsConstexprBool()) {
     VisitResult right_result = Visit(expr->right);
@@ -669,38 +839,34 @@ VisitResult ImplementationVisitor::Visit(LogicalOrExpression* expr) {
                            " || " + right_result.constexpr_value() + ")");
   }
 
-  VisitResult right_result = Visit(expr->right);
-  if (right_result.type()->IsBool()) {
-    Block* true_block = LookupSimpleLabel(kTrueLabelName);
-    Block* false_block = LookupSimpleLabel(kFalseLabelName);
-    assembler().Branch(true_block, false_block);
-    return VisitResult::NeverResult();
-  } else if (!right_result.type()->IsNever()) {
-    ReportError(
-        "expected type bool or never on right-hand side of operator ||");
+  Block* true_block = assembler().NewBlock();
+  Block* false_block = assembler().NewBlock();
+  Block* done_block = assembler().NewBlock();
+
+  left_result = GenerateImplicitConvert(TypeOracle::GetBoolType(), left_result);
+  GenerateBranch(left_result, true_block, false_block);
+
+  assembler().Bind(true_block);
+  VisitResult true_result = GenerateBoolConstant(true);
+  assembler().Goto(done_block);
+
+  assembler().Bind(false_block);
+  VisitResult false_result;
+  {
+    StackScope false_block_scope(this);
+    false_result = false_block_scope.Yield(
+        GenerateImplicitConvert(TypeOracle::GetBoolType(), Visit(expr->right)));
   }
-  return right_result;
+  assembler().Goto(done_block);
+
+  assembler().Bind(done_block);
+  DCHECK_EQ(true_result, false_result);
+  return outer_scope.Yield(true_result);
 }
 
 VisitResult ImplementationVisitor::Visit(LogicalAndExpression* expr) {
-  VisitResult left_result;
-  {
-    Block* true_block = assembler().NewBlock(assembler().CurrentStack());
-    Binding<LocalLabel> false_binding{&LabelBindingsManager::Get(),
-                                      kTrueLabelName, LocalLabel{true_block}};
-    left_result = Visit(expr->left);
-    if (left_result.type()->IsBool()) {
-      Block* false_block = LookupSimpleLabel(kFalseLabelName);
-      assembler().Branch(true_block, false_block);
-      assembler().Bind(true_block);
-    } else if (left_result.type()->IsNever()) {
-      assembler().Bind(true_block);
-    } else if (!left_result.type()->IsConstexprBool()) {
-      ReportError(
-          "expected type bool, constexpr bool, or never on left-hand side of "
-          "operator &&");
-    }
-  }
+  StackScope outer_scope(this);
+  VisitResult left_result = Visit(expr->left);
 
   if (left_result.type()->IsConstexprBool()) {
     VisitResult right_result = Visit(expr->right);
@@ -714,17 +880,38 @@ VisitResult ImplementationVisitor::Visit(LogicalAndExpression* expr) {
                            " && " + right_result.constexpr_value() + ")");
   }
 
-  VisitResult right_result = Visit(expr->right);
-  if (right_result.type()->IsBool()) {
-    Block* true_block = LookupSimpleLabel(kTrueLabelName);
-    Block* false_block = LookupSimpleLabel(kFalseLabelName);
-    assembler().Branch(true_block, false_block);
-    return VisitResult::NeverResult();
-  } else if (!right_result.type()->IsNever()) {
-    ReportError(
-        "expected type bool or never on right-hand side of operator &&");
+  Block* true_block = assembler().NewBlock();
+  Block* false_block = assembler().NewBlock();
+  Block* done_block = assembler().NewBlock();
+
+  left_result = GenerateImplicitConvert(TypeOracle::GetBoolType(), left_result);
+  GenerateBranch(left_result, true_block, false_block);
+
+  assembler().Bind(true_block);
+  VisitResult true_result;
+  {
+    StackScope true_block_scope(this);
+    VisitResult right_result = Visit(expr->right);
+    if (TryGetSourceForBitfieldExpression(expr->left) != nullptr &&
+        TryGetSourceForBitfieldExpression(expr->right) != nullptr &&
+        TryGetSourceForBitfieldExpression(expr->left)->value ==
+            TryGetSourceForBitfieldExpression(expr->right)->value) {
+      Lint(
+          "Please use & rather than && when checking multiple bitfield "
+          "values, to avoid complexity in generated code.");
+    }
+    true_result = true_block_scope.Yield(
+        GenerateImplicitConvert(TypeOracle::GetBoolType(), right_result));
   }
-  return right_result;
+  assembler().Goto(done_block);
+
+  assembler().Bind(false_block);
+  VisitResult false_result = GenerateBoolConstant(false);
+  assembler().Goto(done_block);
+
+  assembler().Bind(done_block);
+  DCHECK_EQ(true_result, false_result);
+  return outer_scope.Yield(true_result);
 }
 
 VisitResult ImplementationVisitor::Visit(IncrementDecrementExpression* expr) {
@@ -758,25 +945,27 @@ VisitResult ImplementationVisitor::Visit(AssignmentExpression* expr) {
   return scope.Yield(assignment_value);
 }
 
-VisitResult ImplementationVisitor::Visit(NumberLiteralExpression* expr) {
-  // TODO(tebbi): Do not silently loose precision; support 64bit literals.
-  double d = std::stod(expr->number.c_str());
-  int32_t i = static_cast<int32_t>(d);
-  const Type* result_type = Declarations::LookupType(CONST_FLOAT64_TYPE_STRING);
-  if (i == d) {
-    if ((i >> 30) == (i >> 31)) {
-      result_type = Declarations::LookupType(CONST_INT31_TYPE_STRING);
-    } else {
-      result_type = Declarations::LookupType(CONST_INT32_TYPE_STRING);
-    }
-  }
-  return VisitResult{result_type, expr->number};
+VisitResult ImplementationVisitor::Visit(FloatingPointLiteralExpression* expr) {
+  const Type* result_type = TypeOracle::GetConstFloat64Type();
+  std::stringstream str;
+  str << std::setprecision(std::numeric_limits<double>::digits10 + 1)
+      << expr->value;
+  return VisitResult{result_type, str.str()};
+}
+
+VisitResult ImplementationVisitor::Visit(IntegerLiteralExpression* expr) {
+  const Type* result_type = TypeOracle::GetIntegerLiteralType();
+  std::stringstream str;
+  str << "IntegerLiteral("
+      << (expr->value.is_negative() ? "true, 0x" : "false, 0x") << std::hex
+      << expr->value.absolute_value() << std::dec << "ull)";
+  return VisitResult{result_type, str.str()};
 }
 
 VisitResult ImplementationVisitor::Visit(AssumeTypeImpossibleExpression* expr) {
   VisitResult result = Visit(expr->expression);
-  const Type* result_type =
-      SubtractType(result.type(), Declarations::GetType(expr->excluded_type));
+  const Type* result_type = SubtractType(
+      result.type(), TypeVisitor::ComputeType(expr->excluded_type));
   if (result_type->IsNever()) {
     ReportError("unreachable code");
   }
@@ -811,12 +1000,31 @@ VisitResult ImplementationVisitor::Visit(LocationExpression* expr) {
   return scope.Yield(GenerateFetchFromLocation(GetLocationReference(expr)));
 }
 
+VisitResult ImplementationVisitor::Visit(FieldAccessExpression* expr) {
+  StackScope scope(this);
+  LocationReference location = GetLocationReference(expr);
+  if (location.IsBitFieldAccess()) {
+    if (auto* identifier = IdentifierExpression::DynamicCast(expr->object)) {
+      bitfield_expressions_[expr] = identifier->name;
+    }
+  }
+  return scope.Yield(GenerateFetchFromLocation(location));
+}
+
 const Type* ImplementationVisitor::Visit(GotoStatement* stmt) {
-  LocalLabel* label = LookupLabel(stmt->label);
+  Binding<LocalLabel>* label = LookupLabel(stmt->label->value);
   size_t parameter_count = label->parameter_types.size();
   if (stmt->arguments.size() != parameter_count) {
     ReportError("goto to label has incorrect number of parameters (expected ",
                 parameter_count, " found ", stmt->arguments.size(), ")");
+  }
+
+  if (GlobalContext::collect_language_server_data()) {
+    LanguageServerData::AddDefinition(stmt->label->pos,
+                                      label->declaration_position());
+  }
+  if (GlobalContext::collect_kythe_data()) {
+    KytheData::AddBindingUse(stmt->label->pos, label);
   }
 
   size_t i = 0;
@@ -983,8 +1191,9 @@ namespace {
 std::string FormatAssertSource(const std::string& str) {
   // Replace all whitespace characters with a space character.
   std::string str_no_newlines = str;
-  std::replace_if(str_no_newlines.begin(), str_no_newlines.end(),
-                  [](unsigned char c) { return isspace(c); }, ' ');
+  std::replace_if(
+      str_no_newlines.begin(), str_no_newlines.end(),
+      [](unsigned char c) { return isspace(c); }, ' ');
 
   // str might include indentation, squash multiple space characters into one.
   std::string result;
@@ -997,32 +1206,56 @@ std::string FormatAssertSource(const std::string& str) {
 }  // namespace
 
 const Type* ImplementationVisitor::Visit(AssertStatement* stmt) {
-  bool do_check = !stmt->debug_only;
+  if (stmt->kind == AssertStatement::AssertKind::kStaticAssert) {
+    std::string message =
+        "static_assert(" + stmt->source + ") at " + ToString(stmt->pos);
+    GenerateCall(QualifiedName({"", TORQUE_INTERNAL_NAMESPACE_STRING},
+                               STATIC_ASSERT_MACRO_STRING),
+                 Arguments{{Visit(stmt->expression),
+                            VisitResult(TypeOracle::GetConstexprStringType(),
+                                        StringLiteralQuote(message))},
+                           {}});
+    return TypeOracle::GetVoidType();
+  }
+  bool do_check = stmt->kind != AssertStatement::AssertKind::kDcheck ||
+                  GlobalContext::force_assert_statements();
 #if defined(DEBUG)
   do_check = true;
 #endif
-  if (do_check) {
-    // CSA_ASSERT & co. are not used here on purpose for two reasons. First,
-    // Torque allows and handles two types of expressions in the if protocol
-    // automagically, ones that return TNode<BoolT> and those that use the
-    // BranchIf(..., Label* true, Label* false) idiom. Because the machinery to
-    // handle this is embedded in the expression handling and to it's not
-    // possible to make the decision to use CSA_ASSERT or CSA_ASSERT_BRANCH
-    // isn't trivial up-front. Secondly, on failure, the assert text should be
-    // the corresponding Torque code, not the -gen.cc code, which would be the
-    // case when using CSA_ASSERT_XXX.
-    Block* true_block = assembler().NewBlock(assembler().CurrentStack());
-    Block* false_block = assembler().NewBlock(assembler().CurrentStack(), true);
-    GenerateExpressionBranch(stmt->expression, true_block, false_block);
+  Block* resume_block;
 
-    assembler().Bind(false_block);
-
-    assembler().Emit(AbortInstruction{
-        AbortInstruction::Kind::kAssertionFailure,
-        "Torque assert '" + FormatAssertSource(stmt->source) + "' failed"});
-
-    assembler().Bind(true_block);
+  if (!do_check) {
+    Block* unreachable_block = assembler().NewBlock(assembler().CurrentStack());
+    resume_block = assembler().NewBlock(assembler().CurrentStack());
+    assembler().Goto(resume_block);
+    assembler().Bind(unreachable_block);
   }
+
+  // CSA_DCHECK & co. are not used here on purpose for two reasons. First,
+  // Torque allows and handles two types of expressions in the if protocol
+  // automagically, ones that return TNode<BoolT> and those that use the
+  // BranchIf(..., Label* true, Label* false) idiom. Because the machinery to
+  // handle this is embedded in the expression handling and to it's not
+  // possible to make the decision to use CSA_DCHECK or CSA_DCHECK_BRANCH
+  // isn't trivial up-front. Secondly, on failure, the assert text should be
+  // the corresponding Torque code, not the -gen.cc code, which would be the
+  // case when using CSA_DCHECK_XXX.
+  Block* true_block = assembler().NewBlock(assembler().CurrentStack());
+  Block* false_block = assembler().NewBlock(assembler().CurrentStack(), true);
+  GenerateExpressionBranch(stmt->expression, true_block, false_block);
+
+  assembler().Bind(false_block);
+
+  assembler().Emit(AbortInstruction{
+      AbortInstruction::Kind::kAssertionFailure,
+      "Torque assert '" + FormatAssertSource(stmt->source) + "' failed"});
+
+  assembler().Bind(true_block);
+
+  if (!do_check) {
+    assembler().Bind(resume_block);
+  }
+
   return TypeOracle::GetVoidType();
 }
 
@@ -1039,7 +1272,7 @@ const Type* ImplementationVisitor::Visit(ReturnStatement* stmt) {
     ReportError(s.str());
   }
   LocalLabel* end =
-      current_callable->IsMacro() ? LookupLabel("_macro_end") : nullptr;
+      current_callable->IsMacro() ? LookupLabel(kMacroEndLabelName) : nullptr;
   if (current_callable->HasReturnValue()) {
     if (!stmt->value) {
       std::stringstream s;
@@ -1060,7 +1293,8 @@ const Type* ImplementationVisitor::Visit(ReturnStatement* stmt) {
         SetReturnValue(return_result);
       }
     } else if (current_callable->IsBuiltin()) {
-      assembler().Emit(ReturnInstruction{});
+      assembler().Emit(ReturnInstruction{
+          LoweredSlotCount(current_callable->signature().return_type)});
     } else {
       UNREACHABLE();
     }
@@ -1075,104 +1309,6 @@ const Type* ImplementationVisitor::Visit(ReturnStatement* stmt) {
   }
   current_callable->IncrementReturns();
   return TypeOracle::GetNeverType();
-}
-
-const Type* ImplementationVisitor::Visit(ForOfLoopStatement* stmt) {
-  VisitResult expression_result = Visit(stmt->iterable);
-  VisitResult begin = stmt->begin
-                          ? Visit(*stmt->begin)
-                          : VisitResult(TypeOracle::GetConstInt31Type(), "0");
-
-  VisitResult end = stmt->end
-                        ? Visit(*stmt->end)
-                        : GenerateCall(".length", {{expression_result}, {}});
-
-  const Type* common_type = GetCommonType(begin.type(), end.type());
-  VisitResult index = GenerateImplicitConvert(common_type, begin);
-
-  Block* body_block = assembler().NewBlock();
-  Block* increment_block = assembler().NewBlock(assembler().CurrentStack());
-  Block* exit_block = assembler().NewBlock(assembler().CurrentStack());
-
-  Block* header_block = assembler().NewBlock();
-
-  assembler().Goto(header_block);
-
-  assembler().Bind(header_block);
-
-  BreakContinueActivator activator(exit_block, increment_block);
-
-  {
-    StackScope comparison_scope(this);
-    VisitResult result = GenerateCall("<", {{index, end}, {}});
-    if (result.type() != TypeOracle::GetBoolType()) {
-      ReportError("operator < with arguments(", *index.type(), ", ",
-                  *end.type(),
-                  ")  used in for-of loop has to return type bool, but "
-                  "returned type ",
-                  *result.type());
-    }
-    comparison_scope.Yield(result);
-  }
-  assembler().Branch(body_block, exit_block);
-
-  assembler().Bind(body_block);
-  {
-    VisitResult element_result;
-    {
-      StackScope element_scope(this);
-      VisitResult result = GenerateCall("[]", {{expression_result, index}, {}});
-      if (stmt->var_declaration->type) {
-        const Type* declared_type =
-            Declarations::GetType(*stmt->var_declaration->type);
-        result = GenerateImplicitConvert(declared_type, result);
-      }
-      element_result = element_scope.Yield(result);
-    }
-    Binding<LocalValue> element_var_binding{&ValueBindingsManager::Get(),
-                                            stmt->var_declaration->name->value,
-                                            LocalValue{true, element_result}};
-    Visit(stmt->body);
-  }
-  assembler().Goto(increment_block);
-
-  assembler().Bind(increment_block);
-  {
-    Arguments increment_args;
-    increment_args.parameters = {index, {TypeOracle::GetConstInt31Type(), "1"}};
-    VisitResult increment_result = GenerateCall("+", increment_args);
-
-    GenerateAssignToLocation(LocationReference::VariableAccess(index),
-                             increment_result);
-  }
-
-  assembler().Goto(header_block);
-
-  assembler().Bind(exit_block);
-  return TypeOracle::GetVoidType();
-}
-
-VisitResult ImplementationVisitor::TemporaryUninitializedStruct(
-    const StructType* struct_type, const std::string& reason) {
-  StackRange range = assembler().TopRange(0);
-  for (const Field& f : struct_type->fields()) {
-    if (const StructType* struct_type =
-            StructType::DynamicCast(f.name_and_type.type)) {
-      range.Extend(
-          TemporaryUninitializedStruct(struct_type, reason).stack_range());
-    } else {
-      std::string descriptor = "uninitialized field '" + f.name_and_type.name +
-                               "' declared at " + PositionAsString(f.pos) +
-                               " (" + reason + ")";
-      TypeVector lowered_types = LowerType(f.name_and_type.type);
-      for (const Type* type : lowered_types) {
-        assembler().Emit(PushUninitializedInstruction{
-            TypeOracle::GetTopType(descriptor, type)});
-      }
-      range.Extend(assembler().TopRange(lowered_types.size()));
-    }
-  }
-  return VisitResult(struct_type, range);
 }
 
 VisitResult ImplementationVisitor::Visit(TryLabelExpression* expr) {
@@ -1192,7 +1328,7 @@ VisitResult ImplementationVisitor::Visit(TryLabelExpression* expr) {
     TypeVector parameter_types;
     for (size_t i = 0; i < parameter_count; ++i) {
       const Type* type =
-          Declarations::GetType(expr->label_block->parameters.types[i]);
+          TypeVisitor::ComputeType(expr->label_block->parameters.types[i]);
       parameter_types.push_back(type);
       if (type->IsConstexpr()) {
         ReportError("no constexpr type allowed for label arguments");
@@ -1225,8 +1361,10 @@ VisitResult ImplementationVisitor::Visit(TryLabelExpression* expr) {
   {
     BlockBindings<LocalValue> parameter_bindings(&ValueBindingsManager::Get());
     for (size_t i = 0; i < parameter_count; ++i) {
-      parameter_bindings.Add(expr->label_block->parameters.names[i],
-                             LocalValue{true, parameters[i]});
+      Identifier* name = expr->label_block->parameters.names[i];
+      parameter_bindings.Add(name,
+                             LocalValue{LocationReference::Temporary(
+                                 parameters[i], "parameter " + name->value)});
     }
 
     label_result = Visit(expr->label_block->body);
@@ -1254,24 +1392,23 @@ VisitResult ImplementationVisitor::Visit(StatementExpression* expr) {
 }
 
 InitializerResults ImplementationVisitor::VisitInitializerResults(
-    const AggregateType* current_aggregate,
+    const ClassType* class_type,
     const std::vector<NameAndExpression>& initializers) {
   InitializerResults result;
   for (const NameAndExpression& initializer : initializers) {
     result.names.push_back(initializer.name);
     Expression* e = initializer.expression;
-    const Field& field =
-        current_aggregate->LookupField(initializer.name->value);
-    auto field_index = field.index;
+    const Field& field = class_type->LookupField(initializer.name->value);
+    bool has_index = field.index.has_value();
     if (SpreadExpression* s = SpreadExpression::DynamicCast(e)) {
-      if (!field_index) {
+      if (!has_index) {
         ReportError(
             "spread expressions can only be used to initialize indexed class "
             "fields ('",
             initializer.name->value, "' is not)");
       }
       e = s->spreadee;
-    } else if (field_index) {
+    } else if (has_index) {
       ReportError("the indexed class field '", initializer.name->value,
                   "' must be initialized with a spread operator");
     }
@@ -1280,166 +1417,210 @@ InitializerResults ImplementationVisitor::VisitInitializerResults(
   return result;
 }
 
-size_t ImplementationVisitor::InitializeAggregateHelper(
-    const AggregateType* aggregate_type, VisitResult allocate_result,
-    const InitializerResults& initializer_results) {
-  const ClassType* current_class = ClassType::DynamicCast(aggregate_type);
-  size_t current = 0;
-  if (current_class) {
-    const ClassType* super = current_class->GetSuperClass();
-    if (super) {
-      current = InitializeAggregateHelper(super, allocate_result,
-                                          initializer_results);
-    }
-  }
-
-  for (Field f : aggregate_type->fields()) {
-    if (current == initializer_results.field_value_map.size()) {
-      ReportError("insufficient number of initializers for ",
-                  aggregate_type->name());
-    }
-    VisitResult current_value =
-        initializer_results.field_value_map.at(f.name_and_type.name);
-    Identifier* fieldname = initializer_results.names[current];
-    if (fieldname->value != f.name_and_type.name) {
-      CurrentSourcePosition::Scope scope(fieldname->pos);
-      ReportError("Expected fieldname \"", f.name_and_type.name,
-                  "\" instead of \"", fieldname->value, "\"");
-    }
-    if (aggregate_type->IsClassType()) {
-      if (f.index) {
-        InitializeFieldFromSpread(allocate_result, f, initializer_results);
-      } else {
-        allocate_result.SetType(aggregate_type);
-        GenerateCopy(allocate_result);
-        assembler().Emit(CreateFieldReferenceInstruction{
-            ClassType::cast(aggregate_type), f.name_and_type.name});
-        VisitResult heap_reference(
-            TypeOracle::GetReferenceType(f.name_and_type.type),
-            assembler().TopRange(2));
-        GenerateAssignToLocation(
-            LocationReference::HeapReference(heap_reference), current_value);
-      }
+LocationReference ImplementationVisitor::GenerateFieldReference(
+    VisitResult object, const Field& field, const ClassType* class_type,
+    bool treat_optional_as_indexed) {
+  if (field.index.has_value()) {
+    LocationReference slice = LocationReference::HeapSlice(
+        GenerateCall(class_type->GetSliceMacroName(field), {{object}, {}}));
+    if (field.index->optional && !treat_optional_as_indexed) {
+      // This field was declared using optional syntax, so any reference to it
+      // is implicitly a reference to the first item.
+      return GenerateReferenceToItemInHeapSlice(
+          slice, {TypeOracle::GetConstInt31Type(), "0"});
     } else {
-      LocationReference struct_field_ref = LocationReference::VariableAccess(
-          ProjectStructField(allocate_result, f.name_and_type.name));
-      GenerateAssignToLocation(struct_field_ref, current_value);
+      return slice;
     }
-    ++current;
   }
-  return current;
+  DCHECK(field.offset.has_value());
+  StackRange result_range = assembler().TopRange(0);
+  result_range.Extend(GenerateCopy(object).stack_range());
+  VisitResult offset =
+      VisitResult(TypeOracle::GetConstInt31Type(), ToString(*field.offset));
+  offset = GenerateImplicitConvert(TypeOracle::GetIntPtrType(), offset);
+  result_range.Extend(offset.stack_range());
+  const Type* type = TypeOracle::GetReferenceType(field.name_and_type.type,
+                                                  field.const_qualified);
+  return LocationReference::HeapReference(VisitResult(type, result_range));
 }
 
-void ImplementationVisitor::InitializeFieldFromSpread(
+// This is used to generate field references during initialization, where we can
+// re-use the offsets used for computing the allocation size.
+LocationReference ImplementationVisitor::GenerateFieldReferenceForInit(
     VisitResult object, const Field& field,
-    const InitializerResults& initializer_results) {
-  StackScope stack_scope(this);
-
-  VisitResult zero(TypeOracle::GetConstInt31Type(), "0");
-  const Type* index_type = (*field.index)->name_and_type.type;
-  VisitResult index = GenerateImplicitConvert(index_type, zero);
-  Block* post_exit_block = assembler().NewBlock(assembler().CurrentStack());
-  Block* exit_block = assembler().NewBlock(assembler().CurrentStack());
-  Block* body_block = assembler().NewBlock(assembler().CurrentStack());
-  Block* fail_block = assembler().NewBlock(assembler().CurrentStack(), true);
-  Block* header_block = assembler().NewBlock(assembler().CurrentStack());
-
-  assembler().Goto(header_block);
-
-  assembler().Bind(header_block);
-  Arguments compare_arguments;
-  compare_arguments.parameters.push_back(index);
-  compare_arguments.parameters.push_back(initializer_results.field_value_map.at(
-      (*field.index)->name_and_type.name));
-  GenerateExpressionBranch(
-      [&]() { return GenerateCall("<", compare_arguments); }, body_block,
-      exit_block);
-
-  assembler().Bind(body_block);
-  {
-    VisitResult spreadee =
-        initializer_results.field_value_map.at(field.name_and_type.name);
-    LocationReference target = LocationReference::VariableAccess(spreadee);
-    Binding<LocalLabel> no_more{&LabelBindingsManager::Get(), "_Done",
-                                LocalLabel{fail_block}};
-
-    // Call the Next() method of the iterator
-    Arguments next_arguments;
-    next_arguments.labels.push_back(&no_more);
-    Callable* callable = LookupMethod("Next", target, next_arguments, {});
-    VisitResult next_result =
-        GenerateCall(callable, target, next_arguments, {}, false);
-    Arguments assign_arguments;
-    assign_arguments.parameters.push_back(object);
-    assign_arguments.parameters.push_back(index);
-    assign_arguments.parameters.push_back(next_result);
-    GenerateCall("[]=", assign_arguments);
-
-    // Increment the indexed field index.
-    LocationReference index_ref = LocationReference::VariableAccess(index);
-    Arguments increment_arguments;
-    VisitResult one = {TypeOracle::GetConstInt31Type(), "1"};
-    increment_arguments.parameters = {index, one};
-    VisitResult assignment_value = GenerateCall("+", increment_arguments);
-    GenerateAssignToLocation(index_ref, assignment_value);
-  }
-  assembler().Goto(header_block);
-
-  assembler().Bind(fail_block);
-  assembler().Emit(AbortInstruction(AbortInstruction::Kind::kUnreachable));
-
-  assembler().Bind(exit_block);
-  assembler().Goto(post_exit_block);
-
-  assembler().Bind(post_exit_block);
-}
-
-void ImplementationVisitor::InitializeAggregate(
-    const AggregateType* aggregate_type, VisitResult allocate_result,
-    const InitializerResults& initializer_results) {
-  size_t consumed_initializers = InitializeAggregateHelper(
-      aggregate_type, allocate_result, initializer_results);
-  if (consumed_initializers != initializer_results.field_value_map.size()) {
-    ReportError("more initializers than fields present in ",
-                aggregate_type->name());
+    const LayoutForInitialization& layout) {
+  StackRange result_range = assembler().TopRange(0);
+  result_range.Extend(GenerateCopy(object).stack_range());
+  VisitResult offset = GenerateImplicitConvert(
+      TypeOracle::GetIntPtrType(), layout.offsets.at(field.name_and_type.name));
+  result_range.Extend(offset.stack_range());
+  if (field.index) {
+    VisitResult length =
+        GenerateCopy(layout.array_lengths.at(field.name_and_type.name));
+    result_range.Extend(length.stack_range());
+    const Type* slice_type =
+        TypeOracle::GetMutableSliceType(field.name_and_type.type);
+    return LocationReference::HeapSlice(VisitResult(slice_type, result_range));
+  } else {
+    // Const fields are writable during initialization.
+    VisitResult heap_reference(
+        TypeOracle::GetMutableReferenceType(field.name_and_type.type),
+        result_range);
+    return LocationReference::HeapReference(heap_reference);
   }
 }
 
-VisitResult ImplementationVisitor::AddVariableObjectSize(
-    VisitResult object_size, const ClassType* current_class,
-    const InitializerResults& initializer_results) {
-  while (current_class != nullptr) {
-    auto current_field = current_class->fields().begin();
-    while (current_field != current_class->fields().end()) {
-      if (current_field->index) {
-        if (!current_field->name_and_type.type->IsSubtypeOf(
-                TypeOracle::GetObjectType())) {
-          ReportError(
-              "allocating objects containing indexed fields of non-object "
-              "types is not yet supported");
-        }
-        VisitResult index_field_size =
-            VisitResult(TypeOracle::GetConstInt31Type(), "kTaggedSize");
-        VisitResult initializer_value = initializer_results.field_value_map.at(
-            (*current_field->index)->name_and_type.name);
-        VisitResult index_intptr_size =
-            GenerateCall("Convert", {{initializer_value}, {}},
-                         {TypeOracle::GetIntPtrType()}, false);
-        VisitResult variable_size = GenerateCall(
-            "*", {{index_intptr_size, index_field_size}, {}}, {}, false);
-        object_size =
-            GenerateCall("+", {{object_size, variable_size}, {}}, {}, false);
-      }
-      ++current_field;
+void ImplementationVisitor::InitializeClass(
+    const ClassType* class_type, VisitResult allocate_result,
+    const InitializerResults& initializer_results,
+    const LayoutForInitialization& layout) {
+  if (const ClassType* super = class_type->GetSuperClass()) {
+    InitializeClass(super, allocate_result, initializer_results, layout);
+  }
+
+  for (Field f : class_type->fields()) {
+    VisitResult initializer_value =
+        initializer_results.field_value_map.at(f.name_and_type.name);
+    LocationReference field =
+        GenerateFieldReferenceForInit(allocate_result, f, layout);
+    if (f.index) {
+      DCHECK(field.IsHeapSlice());
+      VisitResult slice = field.GetVisitResult();
+      GenerateCall(QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING},
+                                 "InitializeFieldsFromIterator"),
+                   {{slice, initializer_value}, {}});
+    } else {
+      GenerateAssignToLocation(field, initializer_value);
     }
-    current_class = current_class->GetSuperClass();
   }
-  return object_size;
+}
+
+VisitResult ImplementationVisitor::GenerateArrayLength(
+    Expression* array_length, Namespace* nspace,
+    const std::map<std::string, LocalValue>& bindings) {
+  StackScope stack_scope(this);
+  CurrentSourcePosition::Scope pos_scope(array_length->pos);
+  // Switch to the namespace where the class was declared.
+  CurrentScope::Scope current_scope_scope(nspace);
+  // Reset local bindings and install local binding for the preceding fields.
+  BindingsManagersScope bindings_managers_scope;
+  BlockBindings<LocalValue> field_bindings(&ValueBindingsManager::Get());
+  for (auto& p : bindings) {
+    field_bindings.Add(p.first, LocalValue{p.second}, true);
+  }
+  VisitResult length = Visit(array_length);
+  VisitResult converted_length =
+      GenerateCall("Convert", Arguments{{length}, {}},
+                   {TypeOracle::GetIntPtrType(), length.type()}, false);
+  return stack_scope.Yield(converted_length);
+}
+
+VisitResult ImplementationVisitor::GenerateArrayLength(VisitResult object,
+                                                       const Field& field) {
+  DCHECK(field.index);
+
+  StackScope stack_scope(this);
+  const ClassType* class_type = *object.type()->ClassSupertype();
+  std::map<std::string, LocalValue> bindings;
+  bool before_current = true;
+  for (Field f : class_type->ComputeAllFields()) {
+    if (field.name_and_type.name == f.name_and_type.name) {
+      before_current = false;
+    }
+    // We can't generate field references eagerly here, because some preceding
+    // fields might be optional, and attempting to get a reference to an
+    // optional field can crash the program if the field isn't present.
+    // Instead, we use the lazy form of LocalValue to only generate field
+    // references if they are used in the length expression.
+    bindings.insert(
+        {f.name_and_type.name,
+         f.const_qualified
+             ? (before_current
+                    ? LocalValue{[=]() {
+                        return GenerateFieldReference(object, f, class_type);
+                      }}
+                    : LocalValue("Array lengths may only refer to fields "
+                                 "defined earlier"))
+             : LocalValue(
+                   "Non-const fields cannot be used for array lengths.")});
+  }
+  return stack_scope.Yield(
+      GenerateArrayLength(field.index->expr, class_type->nspace(), bindings));
+}
+
+VisitResult ImplementationVisitor::GenerateArrayLength(
+    const ClassType* class_type, const InitializerResults& initializer_results,
+    const Field& field) {
+  DCHECK(field.index);
+
+  StackScope stack_scope(this);
+  std::map<std::string, LocalValue> bindings;
+  for (Field f : class_type->ComputeAllFields()) {
+    if (f.index) break;
+    const std::string& fieldname = f.name_and_type.name;
+    VisitResult value = initializer_results.field_value_map.at(fieldname);
+    bindings.insert(
+        {fieldname,
+         f.const_qualified
+             ? LocalValue{LocationReference::Temporary(
+                   value, "initial field " + fieldname)}
+             : LocalValue(
+                   "Non-const fields cannot be used for array lengths.")});
+  }
+  return stack_scope.Yield(
+      GenerateArrayLength(field.index->expr, class_type->nspace(), bindings));
+}
+
+LayoutForInitialization ImplementationVisitor::GenerateLayoutForInitialization(
+    const ClassType* class_type,
+    const InitializerResults& initializer_results) {
+  LayoutForInitialization layout;
+  VisitResult offset;
+  for (Field f : class_type->ComputeAllFields()) {
+    if (f.offset.has_value()) {
+      offset =
+          VisitResult(TypeOracle::GetConstInt31Type(), ToString(*f.offset));
+    }
+    layout.offsets[f.name_and_type.name] = offset;
+    if (f.index) {
+      size_t element_size;
+      std::string element_size_string;
+      std::tie(element_size, element_size_string) =
+          *SizeOf(f.name_and_type.type);
+      VisitResult array_element_size =
+          VisitResult(TypeOracle::GetConstInt31Type(), element_size_string);
+      VisitResult array_length =
+          GenerateArrayLength(class_type, initializer_results, f);
+      layout.array_lengths[f.name_and_type.name] = array_length;
+      Arguments arguments;
+      arguments.parameters = {offset, array_length, array_element_size};
+      offset = GenerateCall(QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING},
+                                          "AddIndexedFieldSizeToObjectSize"),
+                            arguments);
+    } else {
+      DCHECK(f.offset.has_value());
+    }
+  }
+  if (class_type->size().SingleValue()) {
+    layout.size = VisitResult(TypeOracle::GetConstInt31Type(),
+                              ToString(*class_type->size().SingleValue()));
+  } else {
+    layout.size = offset;
+  }
+  if ((size_t{1} << class_type->size().AlignmentLog2()) <
+      TargetArchitecture::TaggedSize()) {
+    Arguments arguments;
+    arguments.parameters = {layout.size};
+    layout.size = GenerateCall(
+        QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING}, "AlignTagged"),
+        arguments);
+  }
+  return layout;
 }
 
 VisitResult ImplementationVisitor::Visit(NewExpression* expr) {
   StackScope stack_scope(this);
-  const Type* type = Declarations::GetType(expr->type);
+  const Type* type = TypeVisitor::ComputeType(expr->type);
   const ClassType* class_type = ClassType::DynamicCast(type);
   if (class_type == nullptr) {
     ReportError("type for new expression must be a class, \"", *type,
@@ -1455,46 +1636,66 @@ VisitResult ImplementationVisitor::Visit(NewExpression* expr) {
   InitializerResults initializer_results =
       VisitInitializerResults(class_type, expr->initializers);
 
-  // Output the code to generate an uninitialized object of the class size in
-  // the GC heap.
-  VisitResult allocate_result;
+  const Field& map_field = class_type->LookupField("map");
+  if (*map_field.offset != 0) {
+    ReportError("class initializers must have a map as first parameter");
+  }
+  const std::map<std::string, VisitResult>& initializer_fields =
+      initializer_results.field_value_map;
+  auto it_object_map = initializer_fields.find(map_field.name_and_type.name);
+  VisitResult object_map;
   if (class_type->IsExtern()) {
-    const Field& map_field = class_type->LookupField("map");
-    if (map_field.offset != 0) {
-      ReportError(
-          "external classes initializers must have a map as first parameter");
+    if (it_object_map == initializer_fields.end()) {
+      ReportError("Constructor for ", class_type->name(),
+                  " needs Map argument!");
     }
-    VisitResult object_map =
-        initializer_results.field_value_map[map_field.name_and_type.name];
-    Arguments size_arguments;
-    size_arguments.parameters.push_back(object_map);
-    VisitResult object_size = GenerateCall("%GetAllocationBaseSize",
-                                           size_arguments, {class_type}, false);
-
-    object_size =
-        AddVariableObjectSize(object_size, class_type, initializer_results);
-
-    Arguments allocate_arguments;
-    allocate_arguments.parameters.push_back(object_size);
-    allocate_result =
-        GenerateCall("%Allocate", allocate_arguments, {class_type}, false);
-    DCHECK(allocate_result.IsOnStack());
+    object_map = it_object_map->second;
   } else {
-    Arguments allocate_arguments;
-    allocate_arguments.parameters.push_back(
-        VisitResult(TypeOracle::GetConstexprIntPtrType(),
-                    std::to_string(class_type->size() / kTaggedSize)));
-    allocate_result = GenerateCall("%AllocateInternalClass", allocate_arguments,
-                                   {class_type}, false);
+    if (it_object_map != initializer_fields.end()) {
+      ReportError(
+          "Constructor for ", class_type->name(),
+          " must not specify Map argument; it is automatically inserted.");
+    }
+    Arguments get_struct_map_arguments;
+    get_struct_map_arguments.parameters.push_back(
+        VisitResult(TypeOracle::GetConstexprInstanceTypeType(),
+                    CapifyStringWithUnderscores(class_type->name()) + "_TYPE"));
+    object_map = GenerateCall(
+        QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING}, "GetInstanceTypeMap"),
+        get_struct_map_arguments, {}, false);
+    CurrentSourcePosition::Scope current_pos(expr->pos);
+    initializer_results.names.insert(initializer_results.names.begin(),
+                                     MakeNode<Identifier>("map"));
+    initializer_results.field_value_map[map_field.name_and_type.name] =
+        object_map;
   }
 
-  InitializeAggregate(class_type, allocate_result, initializer_results);
+  CheckInitializersWellformed(class_type->name(),
+                              class_type->ComputeAllFields(),
+                              expr->initializers, !class_type->IsExtern());
 
-  return stack_scope.Yield(allocate_result);
+  LayoutForInitialization layout =
+      GenerateLayoutForInitialization(class_type, initializer_results);
+
+  Arguments allocate_arguments;
+  allocate_arguments.parameters.push_back(layout.size);
+  allocate_arguments.parameters.push_back(object_map);
+  allocate_arguments.parameters.push_back(
+      GenerateBoolConstant(expr->pretenured));
+  VisitResult allocate_result = GenerateCall(
+      QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING}, "AllocateFromNew"),
+      allocate_arguments, {class_type}, false);
+  DCHECK(allocate_result.IsOnStack());
+
+  InitializeClass(class_type, allocate_result, initializer_results, layout);
+
+  return stack_scope.Yield(GenerateCall(
+      "%RawDownCast", Arguments{{allocate_result}, {}}, {class_type}));
 }
 
 const Type* ImplementationVisitor::Visit(BreakStatement* stmt) {
-  base::Optional<Binding<LocalLabel>*> break_label = TryLookupLabel("_break");
+  base::Optional<Binding<LocalLabel>*> break_label =
+      TryLookupLabel(kBreakLabelName);
   if (!break_label) {
     ReportError("break used outside of loop");
   }
@@ -1504,7 +1705,7 @@ const Type* ImplementationVisitor::Visit(BreakStatement* stmt) {
 
 const Type* ImplementationVisitor::Visit(ContinueStatement* stmt) {
   base::Optional<Binding<LocalLabel>*> continue_label =
-      TryLookupLabel("_continue");
+      TryLookupLabel(kContinueLabelName);
   if (!continue_label) {
     ReportError("continue used outside of loop");
   }
@@ -1570,85 +1771,150 @@ VisitResult ImplementationVisitor::Visit(SpreadExpression* expr) {
       "initialization expressions");
 }
 
-void ImplementationVisitor::GenerateImplementation(const std::string& dir,
-                                                   Namespace* nspace) {
-  std::string new_source(nspace->source());
-  std::string base_file_name =
-      "builtins-" + DashifyString(nspace->name()) + "-from-dsl-gen";
+void ImplementationVisitor::GenerateImplementation(const std::string& dir) {
+  for (SourceId file : SourceFileMap::AllSources()) {
+    std::string base_filename =
+        dir + "/" + SourceFileMap::PathFromV8RootWithoutExtension(file);
+    GlobalContext::PerFileStreams& streams =
+        GlobalContext::GeneratedPerFile(file);
 
-  std::string source_file_name = dir + "/" + base_file_name + ".cc";
-  ReplaceFileContentsIfDifferent(source_file_name, new_source);
-  std::string new_header(nspace->header());
-  std::string header_file_name = dir + "/" + base_file_name + ".h";
-  ReplaceFileContentsIfDifferent(header_file_name, new_header);
-}
-
-void ImplementationVisitor::GenerateMacroFunctionDeclaration(
-    std::ostream& o, const std::string& macro_prefix, Macro* macro) {
-  GenerateFunctionDeclaration(o, macro_prefix, macro->ExternalName(),
-                              macro->signature(), macro->parameter_names());
-}
-
-void ImplementationVisitor::GenerateFunctionDeclaration(
-    std::ostream& o, const std::string& macro_prefix, const std::string& name,
-    const Signature& signature, const NameVector& parameter_names) {
-  if (GlobalContext::verbose()) {
-    std::cout << "generating source for declaration " << name << "\n";
-  }
-
-  if (signature.return_type->IsVoidOrNever()) {
-    o << "void";
-  } else {
-    o << signature.return_type->GetGeneratedTypeName();
-  }
-  o << " " << macro_prefix << name << "(";
-
-  DCHECK_EQ(signature.types().size(), parameter_names.size());
-  auto type_iterator = signature.types().begin();
-  bool first = true;
-  for (const Identifier* name : parameter_names) {
-    if (!first) {
-      o << ", ";
+    std::string csa_cc = streams.csa_ccfile.str();
+    // Insert missing builtin includes where the marker is.
+    {
+      auto pos = csa_cc.find(BuiltinIncludesMarker);
+      CHECK_NE(pos, std::string::npos);
+      std::string includes;
+      for (const SourceId& include : streams.required_builtin_includes) {
+        std::string include_file =
+            SourceFileMap::PathFromV8RootWithoutExtension(include);
+        includes += "#include \"torque-generated/";
+        includes += include_file;
+        includes += "-tq-csa.h\"\n";
+      }
+      csa_cc.replace(pos, strlen(BuiltinIncludesMarker), std::move(includes));
     }
-    const Type* parameter_type = *type_iterator;
-    const std::string& generated_type_name =
-        parameter_type->GetGeneratedTypeName();
-    o << generated_type_name << " " << ExternalParameterName(name->value);
-    type_iterator++;
-    first = false;
+
+    // TODO(torque-builder): Pass file directly.
+    WriteFile(base_filename + "-tq-csa.cc", std::move(csa_cc));
+    WriteFile(base_filename + "-tq-csa.h", streams.csa_headerfile.str());
+    WriteFile(base_filename + "-tq.inc",
+              streams.class_definition_headerfile.str());
+    WriteFile(
+        base_filename + "-tq-inl.inc",
+        streams.class_definition_inline_headerfile_macro_declarations.str() +
+            streams.class_definition_inline_headerfile_macro_definitions.str() +
+            streams.class_definition_inline_headerfile.str());
+    WriteFile(base_filename + "-tq.cc", streams.class_definition_ccfile.str());
+  }
+
+  WriteFile(dir + "/debug-macros.h", debug_macros_h_.str());
+  WriteFile(dir + "/debug-macros.cc", debug_macros_cc_.str());
+}
+
+cpp::Function ImplementationVisitor::GenerateMacroFunctionDeclaration(
+    Macro* macro) {
+  return GenerateFunction(nullptr,
+                          output_type_ == OutputType::kCC
+                              ? macro->CCName()
+                              : output_type_ == OutputType::kCCDebug
+                                    ? macro->CCDebugName()
+                                    : macro->ExternalName(),
+                          macro->signature(), macro->parameter_names());
+}
+
+cpp::Function ImplementationVisitor::GenerateFunction(
+    cpp::Class* owner, const std::string& name, const Signature& signature,
+    const NameVector& parameter_names, bool pass_code_assembler_state,
+    std::vector<std::string>* generated_parameter_names) {
+  cpp::Function f(owner, name);
+  f.SetInline(output_type_ == OutputType::kCC);
+
+  // Set return type.
+  // TODO(torque-builder): Consider an overload of SetReturnType that handles
+  // this.
+  if (signature.return_type->IsVoidOrNever()) {
+    f.SetReturnType("void");
+  } else if (output_type_ == OutputType::kCCDebug) {
+    f.SetReturnType(std::string("Value<") +
+                    signature.return_type->GetDebugType() + ">");
+  } else if (output_type_ == OutputType::kCC) {
+    f.SetReturnType(signature.return_type->GetRuntimeType());
+  } else {
+    DCHECK_EQ(output_type_, OutputType::kCSA);
+    f.SetReturnType(signature.return_type->GetGeneratedTypeName());
+  }
+
+  bool ignore_first_parameter = true;
+  if (output_type_ == OutputType::kCCDebug) {
+    f.AddParameter("d::MemoryAccessor", "accessor");
+  } else if (output_type_ == OutputType::kCSA && pass_code_assembler_state) {
+    f.AddParameter("compiler::CodeAssemblerState*", "state_");
+  } else {
+    ignore_first_parameter = false;
+  }
+
+  // TODO(torque-builder): Consider an overload for AddParameter that handles
+  // this.
+  DCHECK_GE(signature.types().size(), parameter_names.size());
+  for (std::size_t i = 0; i < signature.types().size(); ++i) {
+    const Type* parameter_type = signature.types()[i];
+    std::string type;
+    if (output_type_ == OutputType::kCC) {
+      type = parameter_type->GetRuntimeType();
+    } else if (output_type_ == OutputType::kCCDebug) {
+      type = parameter_type->GetDebugType();
+    } else {
+      DCHECK_EQ(output_type_, OutputType::kCSA);
+      type = parameter_type->GetGeneratedTypeName();
+    }
+    f.AddParameter(std::move(type),
+                   ExternalParameterName(i < parameter_names.size()
+                                             ? parameter_names[i]->value
+                                             : std::to_string(i)));
   }
 
   for (const LabelDeclaration& label_info : signature.labels) {
-    if (!first) {
-      o << ", ";
+    if (output_type_ == OutputType::kCC ||
+        output_type_ == OutputType::kCCDebug) {
+      ReportError("Macros that generate runtime code can't have label exits");
     }
-    o << "compiler::CodeAssemblerLabel* " << ExternalLabelName(label_info.name);
+    f.AddParameter("compiler::CodeAssemblerLabel*",
+                   ExternalLabelName(label_info.name->value));
     size_t i = 0;
     for (const Type* type : label_info.types) {
       std::string generated_type_name;
-      if (type->IsStructType()) {
+      if (type->StructSupertype()) {
         generated_type_name = "\n#error no structs allowed in labels\n";
       } else {
         generated_type_name = "compiler::TypedCodeAssemblerVariable<";
         generated_type_name += type->GetGeneratedTNodeTypeName();
         generated_type_name += ">*";
       }
-      o << ", ";
-      o << generated_type_name << " "
-        << ExternalLabelParameterName(label_info.name, i);
+      f.AddParameter(generated_type_name,
+                     ExternalLabelParameterName(label_info.name->value, i));
       ++i;
     }
   }
 
-  o << ")";
+  if (generated_parameter_names) {
+    *generated_parameter_names = f.GetParameterNames();
+    if (ignore_first_parameter) {
+      DCHECK(!generated_parameter_names->empty());
+      generated_parameter_names->erase(generated_parameter_names->begin());
+    }
+  }
+  return f;
 }
 
 namespace {
 
-void FailCallableLookup(const std::string& reason, const QualifiedName& name,
-                        const TypeVector& parameter_types,
-                        const std::vector<Binding<LocalLabel>*>& labels,
-                        const std::vector<Signature>& candidates) {
+void FailCallableLookup(
+    const std::string& reason, const QualifiedName& name,
+    const TypeVector& parameter_types,
+    const std::vector<Binding<LocalLabel>*>& labels,
+    const std::vector<Signature>& candidates,
+    const std::vector<std::pair<GenericCallable*, std::string>>
+        inapplicable_generics) {
   std::stringstream stream;
   stream << "\n" << reason << ": \n  " << name << "(" << parameter_types << ")";
   if (labels.size() != 0) {
@@ -1662,15 +1928,26 @@ void FailCallableLookup(const std::string& reason, const QualifiedName& name,
     stream << "\n  " << name;
     PrintSignature(stream, signature, false);
   }
+  if (inapplicable_generics.size() != 0) {
+    stream << "\nfailed to instantiate all of these generic declarations:";
+    for (auto& failure : inapplicable_generics) {
+      GenericCallable* generic = failure.first;
+      const std::string& fail_reason = failure.second;
+      stream << "\n  " << generic->name() << " defined at "
+             << PositionAsString(generic->Position()) << ":\n    "
+             << fail_reason << "\n";
+    }
+  }
   ReportError(stream.str());
 }
 
-Callable* GetOrCreateSpecialization(const SpecializationKey& key) {
+Callable* GetOrCreateSpecialization(
+    const SpecializationKey<GenericCallable>& key) {
   if (base::Optional<Callable*> specialization =
           key.generic->GetSpecialization(key.specialized_types)) {
     return *specialization;
   }
-  return DeclarationVisitor().SpecializeImplicit(key);
+  return DeclarationVisitor::SpecializeImplicit(key);
 }
 
 }  // namespace
@@ -1711,6 +1988,25 @@ bool ImplementationVisitor::TestLookupCallable(
                         {}, {}, true) != nullptr;
 }
 
+TypeArgumentInference ImplementationVisitor::InferSpecializationTypes(
+    GenericCallable* generic, const TypeVector& explicit_specialization_types,
+    const TypeVector& explicit_arguments) {
+  std::vector<base::Optional<const Type*>> all_arguments;
+  const ParameterList& parameters = generic->declaration()->parameters;
+  for (size_t i = 0; i < parameters.implicit_count; ++i) {
+    base::Optional<Binding<LocalValue>*> val =
+        TryLookupLocalValue(parameters.names[i]->value);
+    all_arguments.push_back(
+        val ? (*val)->GetLocationReference(*val).ReferencedType()
+            : base::nullopt);
+  }
+  for (const Type* explicit_argument : explicit_arguments) {
+    all_arguments.push_back(explicit_argument);
+  }
+  return generic->InferSpecializationTypes(explicit_specialization_types,
+                                           all_arguments);
+}
+
 template <class Container>
 Callable* ImplementationVisitor::LookupCallable(
     const QualifiedName& name, const Container& declaration_container,
@@ -1721,16 +2017,21 @@ Callable* ImplementationVisitor::LookupCallable(
 
   std::vector<Declarable*> overloads;
   std::vector<Signature> overload_signatures;
+  std::vector<std::pair<GenericCallable*, std::string>> inapplicable_generics;
   for (auto* declarable : declaration_container) {
-    if (Generic* generic = Generic::DynamicCast(declarable)) {
-      base::Optional<TypeVector> inferred_specialization_types =
-          generic->InferSpecializationTypes(specialization_types,
-                                            parameter_types);
-      if (!inferred_specialization_types) continue;
+    if (GenericCallable* generic = GenericCallable::DynamicCast(declarable)) {
+      TypeArgumentInference inference = InferSpecializationTypes(
+          generic, specialization_types, parameter_types);
+      if (inference.HasFailed()) {
+        inapplicable_generics.push_back(
+            std::make_pair(generic, inference.GetFailureReason()));
+        continue;
+      }
       overloads.push_back(generic);
       overload_signatures.push_back(
-          DeclarationVisitor().MakeSpecializedSignature(
-              SpecializationKey{generic, *inferred_specialization_types}));
+          DeclarationVisitor::MakeSpecializedSignature(
+              SpecializationKey<GenericCallable>{generic,
+                                                 inference.GetResult()}));
     } else if (Callable* callable = Callable::DynamicCast(declarable)) {
       overloads.push_back(callable);
       overload_signatures.push_back(callable->signature());
@@ -1740,16 +2041,12 @@ Callable* ImplementationVisitor::LookupCallable(
   std::vector<size_t> candidates;
   for (size_t i = 0; i < overloads.size(); ++i) {
     const Signature& signature = overload_signatures[i];
-    bool try_bool_context = labels.size() == 0 &&
-                            signature.return_type == TypeOracle::GetNeverType();
-    if (IsCompatibleSignature(signature, parameter_types, labels.size()) ||
-        (try_bool_context &&
-         IsCompatibleSignature(signature, parameter_types, 2))) {
+    if (IsCompatibleSignature(signature, parameter_types, labels.size())) {
       candidates.push_back(i);
     }
   }
 
-  if (overloads.empty()) {
+  if (overloads.empty() && inapplicable_generics.empty()) {
     if (silence_errors) return nullptr;
     std::stringstream stream;
     stream << "no matching declaration found for " << name;
@@ -1757,7 +2054,8 @@ Callable* ImplementationVisitor::LookupCallable(
   } else if (candidates.empty()) {
     if (silence_errors) return nullptr;
     FailCallableLookup("cannot find suitable callable with name", name,
-                       parameter_types, labels, overload_signatures);
+                       parameter_types, labels, overload_signatures,
+                       inapplicable_generics);
   }
 
   auto is_better_candidate = [&](size_t a, size_t b) {
@@ -1774,18 +2072,21 @@ Callable* ImplementationVisitor::LookupCallable(
   for (size_t candidate : candidates) {
     if (candidate != best && !is_better_candidate(best, candidate)) {
       std::vector<Signature> candidate_signatures;
+      candidate_signatures.reserve(candidates.size());
       for (size_t i : candidates) {
         candidate_signatures.push_back(overload_signatures[i]);
       }
       FailCallableLookup("ambiguous callable ", name, parameter_types, labels,
-                         candidate_signatures);
+                         candidate_signatures, inapplicable_generics);
     }
   }
 
-  if (Generic* generic = Generic::DynamicCast(overloads[best])) {
+  if (GenericCallable* generic =
+          GenericCallable::DynamicCast(overloads[best])) {
+    TypeArgumentInference inference = InferSpecializationTypes(
+        generic, specialization_types, parameter_types);
     result = GetOrCreateSpecialization(
-        SpecializationKey{generic, *generic->InferSpecializationTypes(
-                                       specialization_types, parameter_types)});
+        SpecializationKey<GenericCallable>{generic, inference.GetResult()});
   } else {
     result = Callable::cast(overloads[best]);
   }
@@ -1810,19 +2111,18 @@ Callable* ImplementationVisitor::LookupCallable(
     const QualifiedName& name, const Container& declaration_container,
     const Arguments& arguments, const TypeVector& specialization_types) {
   return LookupCallable(name, declaration_container,
-                        arguments.parameters.GetTypeVector(), arguments.labels,
-                        specialization_types);
+                        arguments.parameters.ComputeTypeVector(),
+                        arguments.labels, specialization_types);
 }
 
 Method* ImplementationVisitor::LookupMethod(
-    const std::string& name, LocationReference this_reference,
+    const std::string& name, const AggregateType* receiver_type,
     const Arguments& arguments, const TypeVector& specialization_types) {
-  TypeVector types(arguments.parameters.GetTypeVector());
-  types.insert(types.begin(), this_reference.ReferencedType());
-  return Method::cast(LookupCallable(
-      {{}, name},
-      AggregateType::cast(this_reference.ReferencedType())->Methods(name),
-      types, arguments.labels, specialization_types));
+  TypeVector types(arguments.parameters.ComputeTypeVector());
+  types.insert(types.begin(), receiver_type);
+  return Method::cast(LookupCallable({{}, name}, receiver_type->Methods(name),
+                                     types, arguments.labels,
+                                     specialization_types));
 }
 
 const Type* ImplementationVisitor::GetCommonType(const Type* left,
@@ -1849,24 +2149,72 @@ VisitResult ImplementationVisitor::GenerateCopy(const VisitResult& to_copy) {
 
 VisitResult ImplementationVisitor::Visit(StructExpression* expr) {
   StackScope stack_scope(this);
-  const Type* raw_type = Declarations::GetType(expr->type);
-  if (!raw_type->IsStructType()) {
-    ReportError(*raw_type, " is not a struct but used like one");
+
+  auto& initializers = expr->initializers;
+  std::vector<VisitResult> values;
+  std::vector<const Type*> term_argument_types;
+  values.reserve(initializers.size());
+  term_argument_types.reserve(initializers.size());
+
+  // Compute values and types of all initializer arguments
+  for (const NameAndExpression& initializer : initializers) {
+    VisitResult value = Visit(initializer.expression);
+    values.push_back(value);
+    term_argument_types.push_back(value.type());
   }
 
-  const StructType* struct_type = StructType::cast(raw_type);
+  // Compute and check struct type from given struct name and argument types
+  const Type* type = TypeVisitor::ComputeTypeForStructExpression(
+      expr->type, term_argument_types);
+  if (const auto* struct_type = StructType::DynamicCast(type)) {
+    CheckInitializersWellformed(struct_type->name(), struct_type->fields(),
+                                initializers);
 
-  InitializerResults initialization_results =
-      ImplementationVisitor::VisitInitializerResults(struct_type,
-                                                     expr->initializers);
+    // Implicitly convert values and thereby build the struct on the stack
+    StackRange struct_range = assembler().TopRange(0);
+    auto& fields = struct_type->fields();
+    for (size_t i = 0; i < values.size(); i++) {
+      values[i] =
+          GenerateImplicitConvert(fields[i].name_and_type.type, values[i]);
+      struct_range.Extend(values[i].stack_range());
+    }
 
-  // Push uninitialized 'this'
-  VisitResult result = TemporaryUninitializedStruct(
-      struct_type, "it's not initialized in the struct " + struct_type->name());
+    return stack_scope.Yield(VisitResult(struct_type, struct_range));
+  } else {
+    const auto* bitfield_struct_type = BitFieldStructType::cast(type);
+    CheckInitializersWellformed(bitfield_struct_type->name(),
+                                bitfield_struct_type->fields(), initializers);
 
-  InitializeAggregate(struct_type, result, initialization_results);
+    // Create a zero and cast it to the desired bitfield struct type.
+    VisitResult result{TypeOracle::GetConstInt32Type(), "0"};
+    result = GenerateImplicitConvert(TypeOracle::GetInt32Type(), result);
+    result = GenerateCall("Unsigned", Arguments{{result}, {}}, {});
+    result = GenerateCall("%RawDownCast", Arguments{{result}, {}},
+                          {bitfield_struct_type});
 
-  return stack_scope.Yield(result);
+    // Set each field in the result. If these fields are constexpr, then all of
+    // this initialization will end up reduced to a single value during TurboFan
+    // optimization.
+    auto& fields = bitfield_struct_type->fields();
+    for (size_t i = 0; i < values.size(); i++) {
+      values[i] =
+          GenerateImplicitConvert(fields[i].name_and_type.type, values[i]);
+      result = GenerateSetBitField(bitfield_struct_type, fields[i], result,
+                                   values[i], /*starts_as_zero=*/true);
+    }
+
+    return stack_scope.Yield(result);
+  }
+}
+
+VisitResult ImplementationVisitor::GenerateSetBitField(
+    const Type* bitfield_struct_type, const BitField& bitfield,
+    VisitResult bitfield_struct, VisitResult value, bool starts_as_zero) {
+  GenerateCopy(bitfield_struct);
+  GenerateCopy(value);
+  assembler().Emit(
+      StoreBitFieldInstruction{bitfield_struct_type, bitfield, starts_as_zero});
+  return VisitResult(bitfield_struct_type, assembler().TopRange(1));
 }
 
 LocationReference ImplementationVisitor::GetLocationReference(
@@ -1890,14 +2238,22 @@ LocationReference ImplementationVisitor::GetLocationReference(
 
 LocationReference ImplementationVisitor::GetLocationReference(
     FieldAccessExpression* expr) {
-  const std::string& fieldname = expr->field->value;
-  LocationReference reference = GetLocationReference(expr->object);
+  return GenerateFieldAccess(GetLocationReference(expr->object),
+                             expr->field->value, false, expr->field->pos);
+}
+
+LocationReference ImplementationVisitor::GenerateFieldAccess(
+    LocationReference reference, const std::string& fieldname,
+    bool ignore_stuct_field_constness, base::Optional<SourcePosition> pos) {
   if (reference.IsVariableAccess() &&
-      reference.variable().type()->IsStructType()) {
-    const StructType* type = StructType::cast(reference.variable().type());
+      reference.variable().type()->StructSupertype()) {
+    const StructType* type = *reference.variable().type()->StructSupertype();
     const Field& field = type->LookupField(fieldname);
-    if (GlobalContext::collect_language_server_data()) {
-      LanguageServerData::AddDefinition(expr->field->pos, field.pos);
+    if (GlobalContext::collect_language_server_data() && pos.has_value()) {
+      LanguageServerData::AddDefinition(*pos, field.pos);
+    }
+    if (GlobalContext::collect_kythe_data() && pos.has_value()) {
+      KytheData::AddClassFieldUse(*pos, &field);
     }
     if (field.const_qualified) {
       VisitResult t_value = ProjectStructField(reference.variable(), fieldname);
@@ -1908,15 +2264,80 @@ LocationReference ImplementationVisitor::GetLocationReference(
           ProjectStructField(reference.variable(), fieldname));
     }
   }
-  if (reference.IsTemporary() && reference.temporary().type()->IsStructType()) {
-    if (GlobalContext::collect_language_server_data()) {
-      const StructType* type = StructType::cast(reference.temporary().type());
+  if (reference.IsTemporary() &&
+      reference.temporary().type()->StructSupertype()) {
+    if (GlobalContext::collect_language_server_data() && pos.has_value()) {
+      const StructType* type = *reference.temporary().type()->StructSupertype();
       const Field& field = type->LookupField(fieldname);
-      LanguageServerData::AddDefinition(expr->field->pos, field.pos);
+      LanguageServerData::AddDefinition(*pos, field.pos);
     }
     return LocationReference::Temporary(
         ProjectStructField(reference.temporary(), fieldname),
         reference.temporary_description());
+  }
+  if (base::Optional<const Type*> referenced_type =
+          reference.ReferencedType()) {
+    if ((*referenced_type)->IsBitFieldStructType()) {
+      const BitFieldStructType* bitfield_struct =
+          BitFieldStructType::cast(*referenced_type);
+      const BitField& field = bitfield_struct->LookupField(fieldname);
+      return LocationReference::BitFieldAccess(reference, field);
+    }
+    if (const auto type_wrapped_in_smi = Type::MatchUnaryGeneric(
+            (*referenced_type), TypeOracle::GetSmiTaggedGeneric())) {
+      const BitFieldStructType* bitfield_struct =
+          BitFieldStructType::DynamicCast(*type_wrapped_in_smi);
+      if (bitfield_struct == nullptr) {
+        ReportError(
+            "When a value of type SmiTagged<T> is used in a field access "
+            "expression, T is expected to be a bitfield struct type. Instead, "
+            "T "
+            "is ",
+            **type_wrapped_in_smi);
+      }
+      const BitField& field = bitfield_struct->LookupField(fieldname);
+      return LocationReference::BitFieldAccess(reference, field);
+    }
+  }
+  if (reference.IsHeapReference()) {
+    VisitResult ref = reference.heap_reference();
+    bool is_const;
+    auto generic_type =
+        TypeOracle::MatchReferenceGeneric(ref.type(), &is_const);
+    if (!generic_type) {
+      ReportError(
+          "Left-hand side of field access expression is marked as a reference "
+          "but is not of type Reference<...>. Found type: ",
+          ref.type()->ToString());
+    }
+    if (auto struct_type = (*generic_type)->StructSupertype()) {
+      const Field& field = (*struct_type)->LookupField(fieldname);
+      // Update the Reference's type to refer to the field type within the
+      // struct.
+      ref.SetType(TypeOracle::GetReferenceType(
+          field.name_and_type.type,
+          is_const ||
+              (field.const_qualified && !ignore_stuct_field_constness)));
+      if (!field.offset.has_value()) {
+        Error("accessing field with unknown offset").Throw();
+      }
+      if (*field.offset != 0) {
+        // Copy the Reference struct up the stack and update the new copy's
+        // |offset| value to point to the struct field.
+        StackScope scope(this);
+        ref = GenerateCopy(ref);
+        VisitResult ref_offset = ProjectStructField(ref, "offset");
+        VisitResult struct_offset{
+            TypeOracle::GetIntPtrType()->ConstexprVersion(),
+            std::to_string(*field.offset)};
+        VisitResult updated_offset =
+            GenerateCall("+", Arguments{{ref_offset, struct_offset}, {}});
+        assembler().Poke(ref_offset.stack_range(), updated_offset.stack_range(),
+                         ref_offset.type());
+        ref = scope.Yield(ref);
+      }
+      return LocationReference::HeapReference(ref);
+    }
   }
   VisitResult object_result = GenerateFetchFromLocation(reference);
   if (base::Optional<const ClassType*> class_type =
@@ -1927,19 +2348,13 @@ LocationReference ImplementationVisitor::GetLocationReference(
         QualifiedName{"." + fieldname}, {object_result.type()});
     if ((*class_type)->HasField(fieldname) && !has_explicit_overloads) {
       const Field& field = (*class_type)->LookupField(fieldname);
-      if (GlobalContext::collect_language_server_data()) {
-        LanguageServerData::AddDefinition(expr->field->pos, field.pos);
+      if (GlobalContext::collect_language_server_data() && pos.has_value()) {
+        LanguageServerData::AddDefinition(*pos, field.pos);
       }
-      if (field.index) {
-        return LocationReference::IndexedFieldAccess(object_result, fieldname);
-      } else {
-        assembler().Emit(
-            CreateFieldReferenceInstruction{*class_type, fieldname});
-        const Type* reference_type =
-            TypeOracle::GetReferenceType(field.name_and_type.type);
-        return LocationReference::HeapReference(
-            VisitResult(reference_type, assembler().TopRange(2)));
+      if (GlobalContext::collect_kythe_data()) {
+        KytheData::AddClassFieldUse(*pos, &field);
       }
+      return GenerateFieldReference(object_result, field, *class_type);
     }
   }
   return LocationReference::FieldAccess(object_result, fieldname);
@@ -1949,12 +2364,26 @@ LocationReference ImplementationVisitor::GetLocationReference(
     ElementAccessExpression* expr) {
   LocationReference reference = GetLocationReference(expr->array);
   VisitResult index = Visit(expr->index);
-  if (reference.IsIndexedFieldAccess()) {
-    return LocationReference::IndexedFieldIndexedAccess(reference, index);
+  if (reference.IsHeapSlice()) {
+    return GenerateReferenceToItemInHeapSlice(reference, index);
   } else {
     return LocationReference::ArrayAccess(GenerateFetchFromLocation(reference),
                                           index);
   }
+}
+
+LocationReference ImplementationVisitor::GenerateReferenceToItemInHeapSlice(
+    LocationReference slice, VisitResult index) {
+  DCHECK(slice.IsHeapSlice());
+  Arguments arguments{{index}, {}};
+  const StructType* slice_type = *slice.heap_slice().type()->StructSupertype();
+  Method* method = LookupMethod("AtIndex", slice_type, arguments, {});
+  // The reference has to be treated like a normal value when calling methods
+  // on the underlying slice implementation.
+  LocationReference slice_value =
+      LocationReference::Temporary(slice.GetVisitResult(), "slice as value");
+  return LocationReference::HeapReference(
+      GenerateCall(method, std::move(slice_value), arguments, {}, false));
 }
 
 LocationReference ImplementationVisitor::GetLocationReference(
@@ -1966,15 +2395,18 @@ LocationReference ImplementationVisitor::GetLocationReference(
         LanguageServerData::AddDefinition(expr->name->pos,
                                           (*value)->declaration_position());
       }
+      if (GlobalContext::collect_kythe_data()) {
+        if (!expr->IsThis()) {
+          DCHECK_EQ(expr->name->pos.end.column - expr->name->pos.start.column,
+                    expr->name->value.length());
+          KytheData::AddBindingUse(expr->name->pos, *value);
+        }
+      }
       if (expr->generic_arguments.size() != 0) {
         ReportError("cannot have generic parameters on local name ",
                     expr->name);
       }
-      if ((*value)->is_const) {
-        return LocationReference::Temporary(
-            (*value)->value, "constant value " + expr->name->value);
-      }
-      return LocationReference::VariableAccess((*value)->value);
+      return (*value)->GetLocationReference(*value);
     }
   }
 
@@ -1985,15 +2417,18 @@ LocationReference ImplementationVisitor::GetLocationReference(
       QualifiedName(expr->namespace_qualification, expr->name->value);
   if (base::Optional<Builtin*> builtin = Declarations::TryLookupBuiltin(name)) {
     if (GlobalContext::collect_language_server_data()) {
-      LanguageServerData::AddDefinition(expr->name->pos, (*builtin)->pos());
+      LanguageServerData::AddDefinition(expr->name->pos,
+                                        (*builtin)->Position());
     }
+    // TODO(v8:12261): Consider collecting KytheData here.
     return LocationReference::Temporary(GetBuiltinCode(*builtin),
                                         "builtin " + expr->name->value);
   }
   if (expr->generic_arguments.size() != 0) {
-    Generic* generic = Declarations::LookupUniqueGeneric(name);
-    Callable* specialization = GetOrCreateSpecialization(
-        SpecializationKey{generic, GetTypeVector(expr->generic_arguments)});
+    GenericCallable* generic = Declarations::LookupUniqueGeneric(name);
+    Callable* specialization =
+        GetOrCreateSpecialization(SpecializationKey<GenericCallable>{
+            generic, TypeVisitor::ComputeTypeVector(expr->generic_arguments)});
     if (Builtin* builtin = Builtin::DynamicCast(specialization)) {
       DCHECK(!builtin->IsExternal());
       return LocationReference::Temporary(GetBuiltinCode(builtin),
@@ -2004,15 +2439,20 @@ LocationReference ImplementationVisitor::GetLocationReference(
     }
   }
   Value* value = Declarations::LookupValue(name);
+  CHECK(value->Position().source.IsValid());
+  if (auto stream = CurrentFileStreams::Get()) {
+    stream->required_builtin_includes.insert(value->Position().source);
+  }
   if (GlobalContext::collect_language_server_data()) {
     LanguageServerData::AddDefinition(expr->name->pos, value->name()->pos);
   }
   if (auto* constant = NamespaceConstant::DynamicCast(value)) {
+    if (GlobalContext::collect_kythe_data()) {
+      KytheData::AddConstantUse(expr->name->pos, constant);
+    }
     if (constant->type()->IsConstexpr()) {
       return LocationReference::Temporary(
-          VisitResult(constant->type(), constant->ExternalAssemblerName() +
-                                            "(state_)." +
-                                            constant->name()->value + "()"),
+          VisitResult(constant->type(), constant->external_name() + "(state_)"),
           "namespace constant " + expr->name->value);
     }
     assembler().Emit(NamespaceConstantInstruction{constant});
@@ -2023,6 +2463,9 @@ LocationReference ImplementationVisitor::GetLocationReference(
         "namespace constant " + expr->name->value);
   }
   ExternConstant* constant = ExternConstant::cast(value);
+  if (GlobalContext::collect_kythe_data()) {
+    KytheData::AddConstantUse(expr->name->pos, constant);
+  }
   return LocationReference::Temporary(constant->value(),
                                       "extern value " + expr->name->value);
 }
@@ -2030,10 +2473,10 @@ LocationReference ImplementationVisitor::GetLocationReference(
 LocationReference ImplementationVisitor::GetLocationReference(
     DereferenceExpression* expr) {
   VisitResult ref = Visit(expr->reference);
-  const ReferenceType* type = ReferenceType::DynamicCast(ref.type());
-  if (!type) {
-    ReportError("Operator * expects a reference but found a value of type ",
-                *ref.type());
+  if (!TypeOracle::MatchReferenceGeneric(ref.type())) {
+    Error("Operator * expects a reference type but found a value of type ",
+          *ref.type())
+        .Throw();
   }
   return LocationReference::HeapReference(ref);
 }
@@ -2045,12 +2488,36 @@ VisitResult ImplementationVisitor::GenerateFetchFromLocation(
   } else if (reference.IsVariableAccess()) {
     return GenerateCopy(reference.variable());
   } else if (reference.IsHeapReference()) {
-    GenerateCopy(reference.heap_reference());
-    assembler().Emit(LoadReferenceInstruction{reference.ReferencedType()});
-    DCHECK_EQ(1, LoweredSlotCount(reference.ReferencedType()));
-    return VisitResult(reference.ReferencedType(), assembler().TopRange(1));
+    const Type* referenced_type = *reference.ReferencedType();
+    if (referenced_type == TypeOracle::GetFloat64OrHoleType()) {
+      return GenerateCall(QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING},
+                                        "LoadFloat64OrHole"),
+                          Arguments{{reference.heap_reference()}, {}});
+    } else if (auto struct_type = referenced_type->StructSupertype()) {
+      StackRange result_range = assembler().TopRange(0);
+      for (const Field& field : (*struct_type)->fields()) {
+        StackScope scope(this);
+        const std::string& fieldname = field.name_and_type.name;
+        VisitResult field_value = scope.Yield(GenerateFetchFromLocation(
+            GenerateFieldAccess(reference, fieldname)));
+        result_range.Extend(field_value.stack_range());
+      }
+      return VisitResult(referenced_type, result_range);
+    } else {
+      GenerateCopy(reference.heap_reference());
+      assembler().Emit(LoadReferenceInstruction{referenced_type});
+      DCHECK_EQ(1, LoweredSlotCount(referenced_type));
+      return VisitResult(referenced_type, assembler().TopRange(1));
+    }
+  } else if (reference.IsBitFieldAccess()) {
+    // First fetch the bitfield struct, then get the bits out of it.
+    VisitResult bit_field_struct =
+        GenerateFetchFromLocation(reference.bit_field_struct_location());
+    assembler().Emit(LoadBitFieldInstruction{bit_field_struct.type(),
+                                             reference.bit_field()});
+    return VisitResult(*reference.ReferencedType(), assembler().TopRange(1));
   } else {
-    if (reference.IsIndexedFieldAccess()) {
+    if (reference.IsHeapSlice()) {
       ReportError(
           "fetching a value directly from an indexed field isn't allowed");
     }
@@ -2072,16 +2539,66 @@ void ImplementationVisitor::GenerateAssignToLocation(
         GenerateImplicitConvert(variable.type(), assignment_value);
     assembler().Poke(variable.stack_range(), converted_value.stack_range(),
                      variable.type());
-  } else if (reference.IsIndexedFieldAccess()) {
+
+    // Local variables are detected by the existence of a binding. Assignment
+    // to local variables is recorded to support lint errors.
+    if (reference.binding()) {
+      (*reference.binding())->SetWritten();
+    }
+  } else if (reference.IsHeapSlice()) {
     ReportError("assigning a value directly to an indexed field isn't allowed");
   } else if (reference.IsHeapReference()) {
-    const Type* referenced_type = reference.ReferencedType();
-    GenerateCopy(reference.heap_reference());
-    GenerateImplicitConvert(referenced_type, assignment_value);
-    assembler().Emit(StoreReferenceInstruction{referenced_type});
+    const Type* referenced_type = *reference.ReferencedType();
+    if (reference.IsConst()) {
+      Error("cannot assign to const value of type ", *referenced_type).Throw();
+    }
+    if (referenced_type == TypeOracle::GetFloat64OrHoleType()) {
+      GenerateCall(
+          QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING},
+                        "StoreFloat64OrHole"),
+          Arguments{{reference.heap_reference(), assignment_value}, {}});
+    } else if (auto struct_type = referenced_type->StructSupertype()) {
+      if (!assignment_value.type()->IsSubtypeOf(referenced_type)) {
+        ReportError("Cannot assign to ", *referenced_type,
+                    " with value of type ", *assignment_value.type());
+      }
+      for (const Field& field : (*struct_type)->fields()) {
+        const std::string& fieldname = field.name_and_type.name;
+        // Allow assignment of structs even if they contain const fields.
+        // Const on struct fields just disallows direct writes to them.
+        bool ignore_stuct_field_constness = true;
+        GenerateAssignToLocation(
+            GenerateFieldAccess(reference, fieldname,
+                                ignore_stuct_field_constness),
+            ProjectStructField(assignment_value, fieldname));
+      }
+    } else {
+      GenerateCopy(reference.heap_reference());
+      VisitResult converted_assignment_value =
+          GenerateImplicitConvert(referenced_type, assignment_value);
+      if (referenced_type == TypeOracle::GetFloat64Type()) {
+        VisitResult silenced_float_value = GenerateCall(
+            "Float64SilenceNaN", Arguments{{assignment_value}, {}});
+        assembler().Poke(converted_assignment_value.stack_range(),
+                         silenced_float_value.stack_range(), referenced_type);
+      }
+      assembler().Emit(StoreReferenceInstruction{referenced_type});
+    }
+  } else if (reference.IsBitFieldAccess()) {
+    // First fetch the bitfield struct, then set the updated bits, then store
+    // it back to where we found it.
+    VisitResult bit_field_struct =
+        GenerateFetchFromLocation(reference.bit_field_struct_location());
+    VisitResult converted_value =
+        GenerateImplicitConvert(*reference.ReferencedType(), assignment_value);
+    VisitResult updated_bit_field_struct =
+        GenerateSetBitField(bit_field_struct.type(), reference.bit_field(),
+                            bit_field_struct, converted_value);
+    GenerateAssignToLocation(reference.bit_field_struct_location(),
+                             updated_bit_field_struct);
   } else {
     DCHECK(reference.IsTemporary());
-    ReportError("cannot assign to temporary ",
+    ReportError("cannot assign to const-bound or temporary ",
                 reference.temporary_description());
   }
 }
@@ -2089,7 +2606,7 @@ void ImplementationVisitor::GenerateAssignToLocation(
 VisitResult ImplementationVisitor::GeneratePointerCall(
     Expression* callee, const Arguments& arguments, bool is_tailcall) {
   StackScope scope(this);
-  TypeVector parameter_types(arguments.parameters.GetTypeVector());
+  TypeVector parameter_types(arguments.parameters.ComputeTypeVector());
   VisitResult callee_result = Visit(callee);
   if (!callee_result.type()->IsBuiltinPointerType()) {
     std::stringstream stream;
@@ -2142,10 +2659,16 @@ VisitResult ImplementationVisitor::GeneratePointerCall(
 void ImplementationVisitor::AddCallParameter(
     Callable* callable, VisitResult parameter, const Type* parameter_type,
     std::vector<VisitResult>* converted_arguments, StackRange* argument_range,
-    std::vector<std::string>* constexpr_arguments) {
-  VisitResult converted = GenerateImplicitConvert(parameter_type, parameter);
+    std::vector<std::string>* constexpr_arguments, bool inline_macro) {
+  VisitResult converted;
+  if ((converted_arguments->size() < callable->signature().implicit_count) &&
+      parameter.type()->IsTopType()) {
+    converted = GenerateCopy(parameter);
+  } else {
+    converted = GenerateImplicitConvert(parameter_type, parameter);
+  }
   converted_arguments->push_back(converted);
-  if (!callable->ShouldBeInlined()) {
+  if (!inline_macro) {
     if (converted.IsOnStack()) {
       argument_range->Extend(converted.stack_range());
     } else {
@@ -2154,30 +2677,80 @@ void ImplementationVisitor::AddCallParameter(
   }
 }
 
+namespace {
+std::pair<std::string, std::string> GetClassInstanceTypeRange(
+    const ClassType* class_type) {
+  std::pair<std::string, std::string> result;
+  if (class_type->InstanceTypeRange()) {
+    auto instance_type_range = *class_type->InstanceTypeRange();
+    std::string instance_type_string_first =
+        "static_cast<InstanceType>(" +
+        std::to_string(instance_type_range.first) + ")";
+    std::string instance_type_string_second =
+        "static_cast<InstanceType>(" +
+        std::to_string(instance_type_range.second) + ")";
+    result =
+        std::make_pair(instance_type_string_first, instance_type_string_second);
+  } else {
+    ReportError(
+        "%Min/MaxInstanceType must take a class type that is either a string "
+        "or has a generated instance type range");
+  }
+  return result;
+}
+}  // namespace
+
 VisitResult ImplementationVisitor::GenerateCall(
     Callable* callable, base::Optional<LocationReference> this_reference,
     Arguments arguments, const TypeVector& specialization_types,
     bool is_tailcall) {
-  // Operators used in a branching context can also be function calls that never
-  // return but have a True and False label
-  if (arguments.labels.size() == 0 &&
-      callable->signature().labels.size() == 2) {
-    base::Optional<Binding<LocalLabel>*> true_label =
-        TryLookupLabel(kTrueLabelName);
-    base::Optional<Binding<LocalLabel>*> false_label =
-        TryLookupLabel(kFalseLabelName);
-    if (!true_label || !false_label) {
-      ReportError(
-          callable->ReadableName(),
-          " does not return a value, but has to be called in a branching "
-          "context (e.g., conditional or if-condition). You can fix this by "
-          "adding \"? true : false\".");
-    }
-    arguments.labels.push_back(*true_label);
-    arguments.labels.push_back(*false_label);
+  CHECK(callable->Position().source.IsValid());
+  if (auto stream = CurrentFileStreams::Get()) {
+    stream->required_builtin_includes.insert(callable->Position().source);
   }
 
   const Type* return_type = callable->signature().return_type;
+
+  if (is_tailcall) {
+    if (Builtin* builtin = Builtin::DynamicCast(CurrentCallable::Get())) {
+      const Type* outer_return_type = builtin->signature().return_type;
+      if (!return_type->IsSubtypeOf(outer_return_type)) {
+        Error("Cannot tailcall, type of result is ", *return_type,
+              " but should be a subtype of ", *outer_return_type, ".");
+      }
+    } else {
+      Error("Tail calls are only allowed from builtins");
+    }
+  }
+
+  bool inline_macro = callable->ShouldBeInlined(output_type_);
+  std::vector<VisitResult> implicit_arguments;
+  for (size_t i = 0; i < callable->signature().implicit_count; ++i) {
+    std::string implicit_name = callable->signature().parameter_names[i]->value;
+    base::Optional<Binding<LocalValue>*> val =
+        TryLookupLocalValue(implicit_name);
+    if (val) {
+      implicit_arguments.push_back(
+          GenerateFetchFromLocation((*val)->GetLocationReference(*val)));
+    } else {
+      VisitResult unititialized = VisitResult::TopTypeResult(
+          "implicit parameter '" + implicit_name +
+              "' is not defined when invoking " + callable->ReadableName() +
+              " at " + PositionAsString(CurrentSourcePosition::Get()),
+          callable->signature().parameter_types.types[i]);
+      implicit_arguments.push_back(unititialized);
+    }
+    const Type* type = implicit_arguments.back().type();
+    if (const TopType* top_type = TopType::DynamicCast(type)) {
+      if (!callable->IsMacro() || callable->IsExternal()) {
+        ReportError(
+            "unititialized implicit parameters can only be passed to "
+            "Torque-defined macros: the ",
+            top_type->reason());
+      }
+      inline_macro = true;
+    }
+  }
 
   std::vector<VisitResult> converted_arguments;
   StackRange argument_range = assembler().TopRange(0);
@@ -2185,37 +2758,28 @@ VisitResult ImplementationVisitor::GenerateCall(
 
   size_t current = 0;
   for (; current < callable->signature().implicit_count; ++current) {
-    std::string implicit_name =
-        callable->signature().parameter_names[current]->value;
-    base::Optional<Binding<LocalValue>*> val =
-        TryLookupLocalValue(implicit_name);
-    if (!val) {
-      ReportError("implicit parameter '", implicit_name,
-                  "' required for call to '", callable->ReadableName(),
-                  "' is not defined");
-    }
-    AddCallParameter(callable, (*val)->value,
+    AddCallParameter(callable, implicit_arguments[current],
                      callable->signature().parameter_types.types[current],
                      &converted_arguments, &argument_range,
-                     &constexpr_arguments);
+                     &constexpr_arguments, inline_macro);
   }
 
   if (this_reference) {
     DCHECK(callable->IsMethod());
     Method* method = Method::cast(callable);
-    // By now, the this reference should either be a variable or
-    // a temporary, in both cases the fetch of the VisitResult should succeed.
+    // By now, the this reference should either be a variable, a temporary or
+    // a Slice. In either case the fetch of the VisitResult should succeed.
     VisitResult this_value = this_reference->GetVisitResult();
-    if (method->ShouldBeInlined()) {
+    if (inline_macro) {
       if (!this_value.type()->IsSubtypeOf(method->aggregate_type())) {
         ReportError("this parameter must be a subtype of ",
                     *method->aggregate_type(), " but it is of type ",
-                    this_value.type());
+                    *this_value.type());
       }
     } else {
       AddCallParameter(callable, this_value, method->aggregate_type(),
                        &converted_arguments, &argument_range,
-                       &constexpr_arguments);
+                       &constexpr_arguments, inline_macro);
     }
     ++current;
   }
@@ -2225,12 +2789,7 @@ VisitResult ImplementationVisitor::GenerateCall(
                               ? TypeOracle::GetObjectType()
                               : callable->signature().types()[current++];
     AddCallParameter(callable, arg, to_type, &converted_arguments,
-                     &argument_range, &constexpr_arguments);
-  }
-
-  if (GlobalContext::verbose()) {
-    std::cout << "generating code for call to " << callable->ReadableName()
-              << "\n";
+                     &argument_range, &constexpr_arguments, inline_macro);
   }
 
   size_t label_count = callable->signature().labels.size();
@@ -2262,22 +2821,75 @@ VisitResult ImplementationVisitor::GenerateCall(
       return VisitResult::NeverResult();
     } else {
       size_t slot_count = LoweredSlotCount(return_type);
-      DCHECK_LE(slot_count, 1);
-      // TODO(tebbi): Actually, builtins have to return a value, so we should
-      // assert slot_count == 1 here.
+      if (builtin->IsStub()) {
+        if (slot_count < 1 || slot_count > 2) {
+          ReportError(
+              "Builtin with stub linkage is expected to return one or two "
+              "values but returns ",
+              slot_count);
+        }
+      } else {
+        if (slot_count != 1) {
+          ReportError(
+              "Builtin with JS linkage is expected to return one value but "
+              "returns ",
+              slot_count);
+        }
+      }
       return VisitResult(return_type, assembler().TopRange(slot_count));
     }
   } else if (auto* macro = Macro::DynamicCast(callable)) {
     if (is_tailcall) {
       ReportError("can't tail call a macro");
     }
+
+    macro->SetUsed();
+
+    // If we're currently generating a C++ macro and it's calling another macro,
+    // then we need to make sure that we also generate C++ code for the called
+    // macro within the same -inl.inc file.
+    if ((output_type_ == OutputType::kCC ||
+         output_type_ == OutputType::kCCDebug) &&
+        !inline_macro) {
+      if (auto* torque_macro = TorqueMacro::DynamicCast(macro)) {
+        auto* streams = CurrentFileStreams::Get();
+        SourceId file = streams ? streams->file : SourceId::Invalid();
+        GlobalContext::EnsureInCCOutputList(torque_macro, file);
+      }
+    }
+
+    // TODO(torque-builder): Consider a function builder here.
     if (return_type->IsConstexpr()) {
       DCHECK_EQ(0, arguments.labels.size());
       std::stringstream result;
-      result << "(" << macro->external_assembler_name() << "(state_)."
-             << macro->ExternalName() << "(";
+      result << "(";
       bool first = true;
-      for (VisitResult arg : arguments.parameters) {
+      switch (output_type_) {
+        case OutputType::kCSA: {
+          if (auto* extern_macro = ExternMacro::DynamicCast(macro)) {
+            result << extern_macro->external_assembler_name() << "(state_)."
+                   << extern_macro->ExternalName() << "(";
+          } else {
+            result << macro->ExternalName() << "(state_";
+            first = false;
+          }
+          break;
+        }
+        case OutputType::kCC: {
+          auto* extern_macro = ExternMacro::DynamicCast(macro);
+          CHECK_NOT_NULL(extern_macro);
+          result << extern_macro->CCName() << "(";
+          break;
+        }
+        case OutputType::kCCDebug: {
+          auto* extern_macro = ExternMacro::DynamicCast(macro);
+          CHECK_NOT_NULL(extern_macro);
+          result << extern_macro->CCDebugName() << "(accessor";
+          first = false;
+          break;
+        }
+      }
+      for (VisitResult arg : converted_arguments) {
         DCHECK(!arg.IsOnStack());
         if (!first) {
           result << ", ";
@@ -2287,7 +2899,7 @@ VisitResult ImplementationVisitor::GenerateCall(
       }
       result << "))";
       return VisitResult(return_type, result.str());
-    } else if (macro->ShouldBeInlined()) {
+    } else if (inline_macro) {
       std::vector<Block*> label_blocks;
       for (Binding<LocalLabel>* label : arguments.labels) {
         label_blocks.push_back(label->block);
@@ -2339,9 +2951,10 @@ VisitResult ImplementationVisitor::GenerateCall(
         size_t j = 0;
         for (auto t : callable->signature().labels[i].types) {
           const Type* parameter_type = label->parameter_types[j];
-          if (parameter_type != t) {
-            ReportError("mismatch of label parameters (expected ", *t, " got ",
-                        parameter_type, " for parameter ", i + 1, ")");
+          if (!t->IsSubtypeOf(parameter_type)) {
+            ReportError("mismatch of label parameters (label expects ",
+                        *parameter_type, " but macro produces ", *t,
+                        " for parameter ", i + 1, ")");
           }
           j++;
         }
@@ -2366,12 +2979,66 @@ VisitResult ImplementationVisitor::GenerateCall(
     } else {
       size_t slot_count = LoweredSlotCount(return_type);
       DCHECK_LE(slot_count, 1);
-      // TODO(tebbi): Actually, runtime functions have to return a value, so
+      // TODO(turbofan): Actually, runtime functions have to return a value, so
       // we should assert slot_count == 1 here.
       return VisitResult(return_type, assembler().TopRange(slot_count));
     }
   } else if (auto* intrinsic = Intrinsic::DynamicCast(callable)) {
-    if (intrinsic->ExternalName() == "%RawConstexprCast") {
+    if (intrinsic->ExternalName() == "%SizeOf") {
+      if (specialization_types.size() != 1) {
+        ReportError("%SizeOf must take a single type parameter");
+      }
+      const Type* type = specialization_types[0];
+      std::string size_string;
+      if (base::Optional<std::tuple<size_t, std::string>> size = SizeOf(type)) {
+        size_string = std::get<1>(*size);
+      } else {
+        Error("size of ", *type, " is not known.");
+      }
+      return VisitResult(return_type, size_string);
+    } else if (intrinsic->ExternalName() == "%ClassHasMapConstant") {
+      const Type* type = specialization_types[0];
+      const ClassType* class_type = ClassType::DynamicCast(type);
+      if (!class_type) {
+        ReportError("%ClassHasMapConstant must take a class type parameter");
+      }
+      // If the class isn't actually used as the parameter to a TNode,
+      // then we can't rely on the class existing in C++ or being of the same
+      // type (e.g. it could be a template), so don't use the template CSA
+      // machinery for accessing the class' map.
+      if (class_type->name() != class_type->GetGeneratedTNodeTypeName()) {
+        return VisitResult(return_type, std::string("false"));
+      } else {
+        return VisitResult(
+            return_type,
+            std::string("CodeStubAssembler(state_).ClassHasMapConstant<") +
+                class_type->name() + ">()");
+      }
+    } else if (intrinsic->ExternalName() == "%MinInstanceType") {
+      if (specialization_types.size() != 1) {
+        ReportError("%MinInstanceType must take a single type parameter");
+      }
+      const Type* type = specialization_types[0];
+      const ClassType* class_type = ClassType::DynamicCast(type);
+      if (!class_type) {
+        ReportError("%MinInstanceType must take a class type parameter");
+      }
+      std::pair<std::string, std::string> instance_types =
+          GetClassInstanceTypeRange(class_type);
+      return VisitResult(return_type, instance_types.first);
+    } else if (intrinsic->ExternalName() == "%MaxInstanceType") {
+      if (specialization_types.size() != 1) {
+        ReportError("%MaxInstanceType must take a single type parameter");
+      }
+      const Type* type = specialization_types[0];
+      const ClassType* class_type = ClassType::DynamicCast(type);
+      if (!class_type) {
+        ReportError("%MaxInstanceType must take a class type parameter");
+      }
+      std::pair<std::string, std::string> instance_types =
+          GetClassInstanceTypeRange(class_type);
+      return VisitResult(return_type, instance_types.second);
+    } else if (intrinsic->ExternalName() == "%RawConstexprCast") {
       if (intrinsic->signature().parameter_types.types.size() != 1 ||
           constexpr_arguments.size() != 1) {
         ReportError(
@@ -2389,6 +3056,102 @@ VisitResult ImplementationVisitor::GenerateCall(
       result << constexpr_arguments[0];
       result << ")";
       return VisitResult(return_type, result.str());
+    } else if (intrinsic->ExternalName() == "%IndexedFieldLength") {
+      const Type* type = specialization_types[0];
+      const ClassType* class_type = ClassType::DynamicCast(type);
+      if (!class_type) {
+        ReportError("%IndexedFieldLength must take a class type parameter");
+      }
+      const Field& field =
+          class_type->LookupField(StringLiteralUnquote(constexpr_arguments[0]));
+      return GenerateArrayLength(VisitResult(type, argument_range), field);
+    } else if (intrinsic->ExternalName() == "%MakeLazy") {
+      if (specialization_types[0]->IsStructType()) {
+        ReportError("%MakeLazy can't use macros that return structs");
+      }
+      std::string getter_name = StringLiteralUnquote(constexpr_arguments[0]);
+
+      // Normally the parser would split namespace names for us, but we
+      // sidestepped it by putting the macro name in a string literal.
+      QualifiedName qualified_getter_name = QualifiedName::Parse(getter_name);
+
+      // converted_arguments contains all of the arguments to %MakeLazy. We're
+      // looking for a function that takes all but the first.
+      Arguments arguments_to_getter;
+      arguments_to_getter.parameters.insert(
+          arguments_to_getter.parameters.begin(),
+          converted_arguments.begin() + 1, converted_arguments.end());
+
+      Callable* callable_macro = LookupCallable(
+          qualified_getter_name, Declarations::Lookup(qualified_getter_name),
+          arguments_to_getter, {});
+      Macro* getter = Macro::DynamicCast(callable_macro);
+      if (!getter || getter->IsMethod()) {
+        ReportError(
+            "%MakeLazy expects a macro, not builtin or other type of callable");
+      }
+      if (!getter->signature().labels.empty()) {
+        ReportError("%MakeLazy requires a macro with no labels");
+      }
+      if (!getter->signature().return_type->IsSubtypeOf(
+              specialization_types[0])) {
+        ReportError("%MakeLazy expected return type ", *specialization_types[0],
+                    " but found ", *getter->signature().return_type);
+      }
+      if (getter->signature().implicit_count > 0) {
+        ReportError("Implicit parameters are not yet supported in %MakeLazy");
+      }
+
+      getter->SetUsed();  // Prevent warnings about unused macros.
+
+      // Now that we've looked up the getter macro, we have to convert the
+      // arguments again, so that, for example, constexpr arguments can be
+      // coerced to non-constexpr types and put on the stack.
+
+      std::vector<VisitResult> converted_arguments_for_getter;
+      StackRange argument_range_for_getter = assembler().TopRange(0);
+      std::vector<std::string> constexpr_arguments_for_getter;
+
+      size_t arg_count = 0;
+      for (auto arg : arguments_to_getter.parameters) {
+        DCHECK_LT(arg_count, getter->signature().types().size());
+        const Type* to_type = getter->signature().types()[arg_count++];
+        AddCallParameter(getter, arg, to_type, &converted_arguments_for_getter,
+                         &argument_range_for_getter,
+                         &constexpr_arguments_for_getter,
+                         /*inline_macro=*/false);
+      }
+
+      // Now that the arguments are prepared, emit the instruction that consumes
+      // them.
+      assembler().Emit(MakeLazyNodeInstruction{getter, return_type,
+                                               constexpr_arguments_for_getter});
+      return VisitResult(return_type, assembler().TopRange(1));
+    } else if (intrinsic->ExternalName() == "%FieldSlice") {
+      const Type* type = specialization_types[0];
+      const ClassType* class_type = ClassType::DynamicCast(type);
+      if (!class_type) {
+        ReportError("The first type parameter to %FieldSlice must be a class");
+      }
+      const Field& field =
+          class_type->LookupField(StringLiteralUnquote(constexpr_arguments[0]));
+      const Type* expected_slice_type =
+          field.const_qualified
+              ? TypeOracle::GetConstSliceType(field.name_and_type.type)
+              : TypeOracle::GetMutableSliceType(field.name_and_type.type);
+      const Type* declared_slice_type = specialization_types[1];
+      if (expected_slice_type != declared_slice_type) {
+        Error(
+            "The second type parameter to %FieldSlice must be the precise "
+            "slice type for the named field");
+      }
+      LocationReference ref = GenerateFieldReference(
+          VisitResult(type, argument_range), field, class_type,
+          /*treat_optional_as_indexed=*/true);
+      if (!ref.IsHeapSlice()) {
+        ReportError("%FieldSlice expected an indexed or optional field");
+      }
+      return ref.heap_slice();
     } else {
       assembler().Emit(CallIntrinsicInstruction{intrinsic, specialization_types,
                                                 constexpr_arguments});
@@ -2419,6 +3182,7 @@ VisitResult ImplementationVisitor::Visit(CallExpression* expr,
     if (auto* loc_expr = LocationExpression::DynamicCast(expr->arguments[0])) {
       LocationReference ref = GetLocationReference(loc_expr);
       if (ref.IsHeapReference()) return scope.Yield(ref.heap_reference());
+      if (ref.IsHeapSlice()) return scope.Yield(ref.heap_slice());
     }
     ReportError("Unable to create a heap reference.");
   }
@@ -2427,7 +3191,7 @@ VisitResult ImplementationVisitor::Visit(CallExpression* expr,
   QualifiedName name = QualifiedName(expr->callee->namespace_qualification,
                                      expr->callee->name->value);
   TypeVector specialization_types =
-      GetTypeVector(expr->callee->generic_arguments);
+      TypeVisitor::ComputeTypeVector(expr->callee->generic_arguments);
   bool has_template_arguments = !specialization_types.empty();
   for (Expression* arg : expr->arguments)
     arguments.parameters.push_back(Visit(arg));
@@ -2441,7 +3205,23 @@ VisitResult ImplementationVisitor::Visit(CallExpression* expr,
       Callable* callable = LookupCallable(name, Declarations::Lookup(name),
                                           arguments, specialization_types);
       LanguageServerData::AddDefinition(expr->callee->name->pos,
-                                        callable->pos());
+                                        callable->IdentifierPosition());
+    }
+    if (GlobalContext::collect_kythe_data()) {
+      Callable* callable = LookupCallable(name, Declarations::Lookup(name),
+                                          arguments, specialization_types);
+      Callable* caller = CurrentCallable::Get();
+      KytheData::AddCall(caller, expr->callee->name->pos, callable);
+    }
+    if (expr->callee->name->value == "!" && arguments.parameters.size() == 1) {
+      PropagateBitfieldMark(expr->arguments[0], expr);
+    }
+    if (expr->callee->name->value == "==" && arguments.parameters.size() == 2) {
+      if (arguments.parameters[0].type()->IsConstexpr()) {
+        PropagateBitfieldMark(expr->arguments[1], expr);
+      } else if (arguments.parameters[1].type()->IsConstexpr()) {
+        PropagateBitfieldMark(expr->arguments[0], expr);
+      }
     }
     return scope.Yield(
         GenerateCall(name, arguments, specialization_types, is_tailcall));
@@ -2453,14 +3233,14 @@ VisitResult ImplementationVisitor::Visit(CallMethodExpression* expr) {
   Arguments arguments;
   std::string method_name = expr->method->name->value;
   TypeVector specialization_types =
-      GetTypeVector(expr->method->generic_arguments);
+      TypeVisitor::ComputeTypeVector(expr->method->generic_arguments);
   LocationReference target = GetLocationReference(expr->target);
   if (!target.IsVariableAccess()) {
     VisitResult result = GenerateFetchFromLocation(target);
-    target = LocationReference::Temporary(result, "method target result");
+    target = LocationReference::Temporary(result, "this parameter");
   }
   const AggregateType* target_type =
-      AggregateType::DynamicCast(target.ReferencedType());
+      (*target.ReferencedType())->AggregateSupertype().value_or(nullptr);
   if (!target_type) {
     ReportError("target of method call not a struct or class type");
   }
@@ -2468,22 +3248,30 @@ VisitResult ImplementationVisitor::Visit(CallMethodExpression* expr) {
     arguments.parameters.push_back(Visit(arg));
   }
   arguments.labels = LabelsFromIdentifiers(expr->labels);
-  TypeVector argument_types = arguments.parameters.GetTypeVector();
+  TypeVector argument_types = arguments.parameters.ComputeTypeVector();
   DCHECK_EQ(expr->method->namespace_qualification.size(), 0);
   QualifiedName qualified_name = QualifiedName(method_name);
-  Callable* callable = nullptr;
-  callable = LookupMethod(method_name, target, arguments, {});
+  Callable* callable = LookupMethod(method_name, target_type, arguments, {});
+  if (GlobalContext::collect_language_server_data()) {
+    LanguageServerData::AddDefinition(expr->method->name->pos,
+                                      callable->IdentifierPosition());
+  }
+  if (GlobalContext::collect_kythe_data()) {
+    Callable* caller = CurrentCallable::Get();
+    KytheData::AddCall(caller, expr->method->name->pos, callable);
+  }
   return scope.Yield(GenerateCall(callable, target, arguments, {}, false));
 }
 
 VisitResult ImplementationVisitor::Visit(IntrinsicCallExpression* expr) {
   StackScope scope(this);
   Arguments arguments;
-  TypeVector specialization_types = GetTypeVector(expr->generic_arguments);
+  TypeVector specialization_types =
+      TypeVisitor::ComputeTypeVector(expr->generic_arguments);
   for (Expression* arg : expr->arguments)
     arguments.parameters.push_back(Visit(arg));
   return scope.Yield(
-      GenerateCall(expr->name, arguments, specialization_types, false));
+      GenerateCall(expr->name->value, arguments, specialization_types, false));
 }
 
 void ImplementationVisitor::GenerateBranch(const VisitResult& condition,
@@ -2494,32 +3282,20 @@ void ImplementationVisitor::GenerateBranch(const VisitResult& condition,
   assembler().Branch(true_block, false_block);
 }
 
-void ImplementationVisitor::GenerateExpressionBranch(
-    VisitResultGenerator generator, Block* true_block, Block* false_block) {
-  // Conditional expressions can either explicitly return a bit
-  // type, or they can be backed by macros that don't return but
-  // take a true and false label. By declaring the labels before
-  // visiting the conditional expression, those label-based
-  // macro conditionals will be able to find them through normal
-  // label lookups.
-  Binding<LocalLabel> true_binding{&LabelBindingsManager::Get(), kTrueLabelName,
-                                   LocalLabel{true_block}};
-  Binding<LocalLabel> false_binding{&LabelBindingsManager::Get(),
-                                    kFalseLabelName, LocalLabel{false_block}};
-  StackScope stack_scope(this);
-  VisitResult expression_result = generator();
-  if (!expression_result.type()->IsNever()) {
-    expression_result = stack_scope.Yield(
-        GenerateImplicitConvert(TypeOracle::GetBoolType(), expression_result));
-    GenerateBranch(expression_result, true_block, false_block);
-  }
+VisitResult ImplementationVisitor::GenerateBoolConstant(bool constant) {
+  return GenerateImplicitConvert(TypeOracle::GetBoolType(),
+                                 VisitResult(TypeOracle::GetConstexprBoolType(),
+                                             constant ? "true" : "false"));
 }
 
 void ImplementationVisitor::GenerateExpressionBranch(Expression* expression,
                                                      Block* true_block,
                                                      Block* false_block) {
-  GenerateExpressionBranch([&]() { return this->Visit(expression); },
-                           true_block, false_block);
+  StackScope stack_scope(this);
+  VisitResult expression_result = this->Visit(expression);
+  expression_result = stack_scope.Yield(
+      GenerateImplicitConvert(TypeOracle::GetBoolType(), expression_result));
+  GenerateBranch(expression_result, true_block, false_block);
 }
 
 VisitResult ImplementationVisitor::GenerateImplicitConvert(
@@ -2533,17 +3309,23 @@ VisitResult ImplementationVisitor::GenerateImplicitConvert(
     return scope.Yield(GenerateCopy(source));
   }
 
-  if (TypeOracle::IsImplicitlyConvertableFrom(destination_type,
-                                              source.type())) {
-    return scope.Yield(GenerateCall(kFromConstexprMacroName, {{source}, {}},
-                                    {destination_type, source.type()}, false));
+  if (auto from = TypeOracle::ImplicitlyConvertableFrom(destination_type,
+                                                        source.type())) {
+    return scope.Yield(GenerateCall(kFromConstexprMacroName,
+                                    Arguments{{source}, {}},
+                                    {destination_type, *from}, false));
   } else if (IsAssignableFrom(destination_type, source.type())) {
     source.SetType(destination_type);
     return scope.Yield(GenerateCopy(source));
   } else {
     std::stringstream s;
-    s << "cannot use expression of type " << *source.type()
-      << " as a value of type " << *destination_type;
+    if (const TopType* top_type = TopType::DynamicCast(source.type())) {
+      s << "undefined expression of type " << *destination_type << ": the "
+        << top_type->reason();
+    } else {
+      s << "cannot use expression of type " << *source.type()
+        << " as a value of type " << *destination_type;
+    }
     ReportError(s.str());
   }
 }
@@ -2554,11 +3336,21 @@ StackRange ImplementationVisitor::GenerateLabelGoto(
 }
 
 std::vector<Binding<LocalLabel>*> ImplementationVisitor::LabelsFromIdentifiers(
-    const std::vector<std::string>& names) {
+    const std::vector<Identifier*>& names) {
   std::vector<Binding<LocalLabel>*> result;
   result.reserve(names.size());
   for (const auto& name : names) {
-    result.push_back(LookupLabel(name));
+    Binding<LocalLabel>* label = LookupLabel(name->value);
+    result.push_back(label);
+
+    // Link up labels in "otherwise" part of the call expression with
+    // either the label in the signature of the calling macro or the label
+    // block ofa surrounding "try".
+    if (GlobalContext::collect_language_server_data()) {
+      LanguageServerData::AddDefinition(name->pos,
+                                        label->declaration_position());
+    }
+    // TODO(v8:12261): Might have to track KytheData here.
   }
   return result;
 }
@@ -2566,19 +3358,15 @@ std::vector<Binding<LocalLabel>*> ImplementationVisitor::LabelsFromIdentifiers(
 StackRange ImplementationVisitor::LowerParameter(
     const Type* type, const std::string& parameter_name,
     Stack<std::string>* lowered_parameters) {
-  if (const StructType* struct_type = StructType::DynamicCast(type)) {
+  if (base::Optional<const StructType*> struct_type = type->StructSupertype()) {
     StackRange range = lowered_parameters->TopRange(0);
-    for (auto& field : struct_type->fields()) {
+    for (auto& field : (*struct_type)->fields()) {
       StackRange parameter_range = LowerParameter(
           field.name_and_type.type,
           parameter_name + "." + field.name_and_type.name, lowered_parameters);
       range.Extend(parameter_range);
     }
     return range;
-  } else if (type->IsReferenceType()) {
-    lowered_parameters->Push(parameter_name + ".object");
-    lowered_parameters->Push(parameter_name + ".offset");
-    return lowered_parameters->TopRange(2);
   } else {
     lowered_parameters->Push(parameter_name);
     return lowered_parameters->TopRange(1);
@@ -2588,8 +3376,8 @@ StackRange ImplementationVisitor::LowerParameter(
 void ImplementationVisitor::LowerLabelParameter(
     const Type* type, const std::string& parameter_name,
     std::vector<std::string>* lowered_parameters) {
-  if (const StructType* struct_type = StructType::DynamicCast(type)) {
-    for (auto& field : struct_type->fields()) {
+  if (base::Optional<const StructType*> struct_type = type->StructSupertype()) {
+    for (auto& field : (*struct_type)->fields()) {
       LowerLabelParameter(
           field.name_and_type.type,
           "&((*" + parameter_name + ")." + field.name_and_type.name + ")",
@@ -2618,6 +3406,7 @@ std::string ImplementationVisitor::ExternalParameterName(
 DEFINE_CONTEXTUAL_VARIABLE(ImplementationVisitor::ValueBindingsManager)
 DEFINE_CONTEXTUAL_VARIABLE(ImplementationVisitor::LabelBindingsManager)
 DEFINE_CONTEXTUAL_VARIABLE(ImplementationVisitor::CurrentCallable)
+DEFINE_CONTEXTUAL_VARIABLE(ImplementationVisitor::CurrentFileStreams)
 DEFINE_CONTEXTUAL_VARIABLE(ImplementationVisitor::CurrentReturnValue)
 
 bool IsCompatibleSignature(const Signature& sig, const TypeVector& types,
@@ -2640,7 +3429,7 @@ bool IsCompatibleSignature(const Signature& sig, const TypeVector& types,
 base::Optional<Block*> ImplementationVisitor::GetCatchBlock() {
   base::Optional<Block*> catch_block;
   if (base::Optional<Binding<LocalLabel>*> catch_handler =
-          TryLookupLabel("_catch")) {
+          TryLookupLabel(kCatchLabelName)) {
     catch_block = assembler().NewBlock(base::nullopt, true);
   }
   return catch_block;
@@ -2650,34 +3439,81 @@ void ImplementationVisitor::GenerateCatchBlock(
     base::Optional<Block*> catch_block) {
   if (catch_block) {
     base::Optional<Binding<LocalLabel>*> catch_handler =
-        TryLookupLabel("_catch");
+        TryLookupLabel(kCatchLabelName);
+    // Reset the local scopes to prevent the macro calls below from using the
+    // current catch handler.
+    BindingsManagersScope bindings_managers_scope;
     if (assembler().CurrentBlockIsComplete()) {
       assembler().Bind(*catch_block);
-      assembler().Goto((*catch_handler)->block, 1);
+      GenerateCall(QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING},
+                                 "GetAndResetPendingMessage"),
+                   Arguments{{}, {}}, {}, false);
+      assembler().Goto((*catch_handler)->block, 2);
     } else {
       CfgAssemblerScopedTemporaryBlock temp(&assembler(), *catch_block);
-      assembler().Goto((*catch_handler)->block, 1);
+      GenerateCall(QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING},
+                                 "GetAndResetPendingMessage"),
+                   Arguments{{}, {}}, {}, false);
+      assembler().Goto((*catch_handler)->block, 2);
     }
   }
 }
-
 void ImplementationVisitor::VisitAllDeclarables() {
   CurrentCallable::Scope current_callable(nullptr);
   const std::vector<std::unique_ptr<Declarable>>& all_declarables =
       GlobalContext::AllDeclarables();
+
   // This has to be an index-based loop because all_declarables can be extended
   // during the loop.
   for (size_t i = 0; i < all_declarables.size(); ++i) {
-    Visit(all_declarables[i].get());
+    try {
+      Visit(all_declarables[i].get());
+    } catch (TorqueAbortCompilation&) {
+      // Recover from compile errors here. The error is recorded already.
+    }
   }
+
+  // Do the same for macros which generate C++ code.
+  output_type_ = OutputType::kCC;
+  const std::vector<std::pair<TorqueMacro*, SourceId>>& cc_macros =
+      GlobalContext::AllMacrosForCCOutput();
+  for (size_t i = 0; i < cc_macros.size(); ++i) {
+    try {
+      Visit(static_cast<Declarable*>(cc_macros[i].first), cc_macros[i].second);
+    } catch (TorqueAbortCompilation&) {
+      // Recover from compile errors here. The error is recorded already.
+    }
+  }
+
+  // Do the same for macros which generate C++ debug code.
+  // The set of macros is the same as C++ macros.
+  output_type_ = OutputType::kCCDebug;
+  for (size_t i = 0; i < cc_macros.size(); ++i) {
+    try {
+      Visit(static_cast<Declarable*>(cc_macros[i].first), cc_macros[i].second);
+    } catch (TorqueAbortCompilation&) {
+      // Recover from compile errors here. The error is recorded already.
+    }
+  }
+  output_type_ = OutputType::kCSA;
 }
 
-void ImplementationVisitor::Visit(Declarable* declarable) {
+void ImplementationVisitor::Visit(Declarable* declarable,
+                                  base::Optional<SourceId> file) {
   CurrentScope::Scope current_scope(declarable->ParentScope());
-  CurrentSourcePosition::Scope current_source_position(declarable->pos());
+  CurrentSourcePosition::Scope current_source_position(declarable->Position());
+  CurrentFileStreams::Scope current_file_streams(
+      &GlobalContext::GeneratedPerFile(file ? *file
+                                            : declarable->Position().source));
+  if (Callable* callable = Callable::DynamicCast(declarable)) {
+    if (!callable->ShouldGenerateExternalCode(output_type_))
+      CurrentFileStreams::Get() = nullptr;
+  }
   switch (declarable->kind()) {
-    case Declarable::kMacro:
-      return Visit(Macro::cast(declarable));
+    case Declarable::kExternMacro:
+      return Visit(ExternMacro::cast(declarable));
+    case Declarable::kTorqueMacro:
+      return Visit(TorqueMacro::cast(declarable));
     case Declarable::kMethod:
       return Visit(Method::cast(declarable));
     case Declarable::kBuiltin:
@@ -2690,258 +3526,1986 @@ void ImplementationVisitor::Visit(Declarable* declarable) {
     case Declarable::kIntrinsic:
     case Declarable::kExternConstant:
     case Declarable::kNamespace:
-    case Declarable::kGeneric:
+    case Declarable::kGenericCallable:
+    case Declarable::kGenericType:
       return;
   }
 }
 
-void ImplementationVisitor::GenerateBuiltinDefinitions(std::string& file_name) {
-  std::stringstream new_contents_stream;
-  new_contents_stream
-      << "#ifndef V8_BUILTINS_BUILTIN_DEFINITIONS_FROM_DSL_H_\n"
-         "#define V8_BUILTINS_BUILTIN_DEFINITIONS_FROM_DSL_H_\n"
-         "\n"
-         "#define BUILTIN_LIST_FROM_DSL(CPP, API, TFJ, TFC, TFS, TFH, ASM) "
-         "\\\n";
-  for (auto& declarable : GlobalContext::AllDeclarables()) {
-    Builtin* builtin = Builtin::DynamicCast(declarable.get());
-    if (!builtin || builtin->IsExternal()) continue;
-    int firstParameterIndex = 1;
-    bool declareParameters = true;
-    if (builtin->IsStub()) {
-      new_contents_stream << "TFS(" << builtin->ExternalName();
-    } else {
-      new_contents_stream << "TFJ(" << builtin->ExternalName();
-      if (builtin->IsVarArgsJavaScript()) {
-        new_contents_stream
-            << ", SharedFunctionInfo::kDontAdaptArgumentsSentinel";
-        declareParameters = false;
-      } else {
-        assert(builtin->IsFixedArgsJavaScript());
-        // FixedArg javascript builtins need to offer the parameter
-        // count.
-        assert(builtin->parameter_names().size() >= 2);
-        new_contents_stream << ", " << (builtin->parameter_names().size() - 2);
-        // And the receiver is explicitly declared.
-        new_contents_stream << ", kReceiver";
-        firstParameterIndex = 2;
-      }
-    }
-    if (declareParameters) {
-      int index = 0;
-      for (const auto& parameter : builtin->parameter_names()) {
-        if (index >= firstParameterIndex) {
-          new_contents_stream << ", k" << CamelifyString(parameter->value);
+std::string MachineTypeString(const Type* type) {
+  if (type->IsSubtypeOf(TypeOracle::GetSmiType())) {
+    return "MachineType::TaggedSigned()";
+  }
+  if (type->IsSubtypeOf(TypeOracle::GetHeapObjectType())) {
+    return "MachineType::TaggedPointer()";
+  }
+  if (type->IsSubtypeOf(TypeOracle::GetTaggedType())) {
+    return "MachineType::AnyTagged()";
+  }
+  return "MachineTypeOf<" + type->GetGeneratedTNodeTypeName() + ">::value";
+}
+
+void ImplementationVisitor::GenerateBuiltinDefinitionsAndInterfaceDescriptors(
+    const std::string& output_directory) {
+  std::stringstream builtin_definitions;
+  std::string builtin_definitions_file_name = "builtin-definitions.h";
+
+  // This file contains plain interface descriptor definitions and has to be
+  // included in the middle of interface-descriptors.h. Thus it is not a normal
+  // header file and uses the .inc suffix instead of the .h suffix.
+  std::stringstream interface_descriptors;
+  std::string interface_descriptors_file_name = "interface-descriptors.inc";
+  {
+    IncludeGuardScope builtin_definitions_include_guard(
+        builtin_definitions, builtin_definitions_file_name);
+
+    builtin_definitions
+        << "\n"
+           "#define BUILTIN_LIST_FROM_TORQUE(CPP, TFJ, TFC, TFS, TFH, "
+           "ASM) "
+           "\\\n";
+    for (auto& declarable : GlobalContext::AllDeclarables()) {
+      Builtin* builtin = Builtin::DynamicCast(declarable.get());
+      if (!builtin || builtin->IsExternal()) continue;
+      if (builtin->IsStub()) {
+        builtin_definitions << "TFC(" << builtin->ExternalName() << ", "
+                            << builtin->ExternalName();
+        std::string descriptor_name = builtin->ExternalName() + "Descriptor";
+        bool has_context_parameter = builtin->signature().HasContextParameter();
+        size_t kFirstNonContextParameter = has_context_parameter ? 1 : 0;
+        TypeVector return_types = LowerType(builtin->signature().return_type);
+
+        interface_descriptors << "class " << descriptor_name
+                              << " : public StaticCallInterfaceDescriptor<"
+                              << descriptor_name << "> {\n";
+
+        interface_descriptors << " public:\n";
+
+        if (has_context_parameter) {
+          interface_descriptors << "  DEFINE_RESULT_AND_PARAMETERS(";
+        } else {
+          interface_descriptors << "  DEFINE_RESULT_AND_PARAMETERS_NO_CONTEXT(";
         }
-        index++;
+        interface_descriptors << return_types.size();
+        for (size_t i = kFirstNonContextParameter;
+             i < builtin->parameter_names().size(); ++i) {
+          Identifier* parameter = builtin->parameter_names()[i];
+          interface_descriptors << ", k" << CamelifyString(parameter->value);
+        }
+        interface_descriptors << ")\n";
+
+        interface_descriptors << "  DEFINE_RESULT_AND_PARAMETER_TYPES(";
+        PrintCommaSeparatedList(interface_descriptors, return_types,
+                                MachineTypeString);
+        for (size_t i = kFirstNonContextParameter;
+             i < builtin->parameter_names().size(); ++i) {
+          const Type* type = builtin->signature().parameter_types.types[i];
+          interface_descriptors << ", " << MachineTypeString(type);
+        }
+        interface_descriptors << ")\n";
+
+        interface_descriptors << "  DECLARE_DEFAULT_DESCRIPTOR("
+                              << descriptor_name << ")\n";
+        interface_descriptors << "};\n\n";
+      } else {
+        builtin_definitions << "TFJ(" << builtin->ExternalName();
+        if (builtin->IsVarArgsJavaScript()) {
+          builtin_definitions << ", kDontAdaptArgumentsSentinel";
+        } else {
+          DCHECK(builtin->IsFixedArgsJavaScript());
+          // FixedArg javascript builtins need to offer the parameter
+          // count.
+          int parameter_count =
+              static_cast<int>(builtin->signature().ExplicitCount());
+          builtin_definitions << ", JSParameterCount(" << parameter_count
+                              << ")";
+          // And the receiver is explicitly declared.
+          builtin_definitions << ", kReceiver";
+          for (size_t i = builtin->signature().implicit_count;
+               i < builtin->parameter_names().size(); ++i) {
+            Identifier* parameter = builtin->parameter_names()[i];
+            builtin_definitions << ", k" << CamelifyString(parameter->value);
+          }
+        }
       }
+      builtin_definitions << ") \\\n";
     }
-    new_contents_stream << ") \\\n";
-  }
-  new_contents_stream << "\n";
+    builtin_definitions << "\n";
 
-  new_contents_stream
-      << "#define TORQUE_FUNCTION_POINTER_TYPE_TO_BUILTIN_MAP(V) \\\n";
-  for (const BuiltinPointerType* type : TypeOracle::AllBuiltinPointerTypes()) {
-    Builtin* example_builtin =
-        Declarations::FindSomeInternalBuiltinWithType(type);
-    if (!example_builtin) {
-      CurrentSourcePosition::Scope current_source_position(
-          SourcePosition{CurrentSourceFile::Get(), {-1, -1}, {-1, -1}});
-      ReportError("unable to find any builtin with type \"", *type, "\"");
+    builtin_definitions
+        << "#define TORQUE_FUNCTION_POINTER_TYPE_TO_BUILTIN_MAP(V) \\\n";
+    for (const BuiltinPointerType* type :
+         TypeOracle::AllBuiltinPointerTypes()) {
+      Builtin* example_builtin =
+          Declarations::FindSomeInternalBuiltinWithType(type);
+      if (!example_builtin) {
+        CurrentSourcePosition::Scope current_source_position(
+            SourcePosition{CurrentSourceFile::Get(), LineAndColumn::Invalid(),
+                           LineAndColumn::Invalid()});
+        ReportError("unable to find any builtin with type \"", *type, "\"");
+      }
+      builtin_definitions << "  V(" << type->function_pointer_type_id() << ","
+                          << example_builtin->ExternalName() << ")\\\n";
     }
-    new_contents_stream << "  V(" << type->function_pointer_type_id() << ","
-                        << example_builtin->ExternalName() << ")\\\n";
+    builtin_definitions << "\n";
   }
-  new_contents_stream << "\n";
-
-  new_contents_stream
-      << "#endif  // V8_BUILTINS_BUILTIN_DEFINITIONS_FROM_DSL_H_\n";
-
-  std::string new_contents(new_contents_stream.str());
-  ReplaceFileContentsIfDifferent(file_name, new_contents);
+  WriteFile(output_directory + "/" + builtin_definitions_file_name,
+            builtin_definitions.str());
+  WriteFile(output_directory + "/" + interface_descriptors_file_name,
+            interface_descriptors.str());
 }
 
 namespace {
 
-enum class FieldSectionType {
+enum class FieldSectionType : uint32_t {
   kNoSection = 0,
-  kWeakSection,
-  kStrongSection,
-  kScalarSection
+  kWeakSection = 1 << 0,
+  kStrongSection = 2 << 0,
+  kScalarSection = 3 << 0
 };
 
-void PossiblyStartTagged(FieldSectionType* section,
-                         std::set<FieldSectionType>* completed_sections,
-                         std::stringstream* o) {
-  if (completed_sections->count(FieldSectionType::kWeakSection) == 0 &&
-      completed_sections->count(FieldSectionType::kStrongSection) == 0 &&
-      *section != FieldSectionType::kWeakSection &&
-      *section != FieldSectionType::kStrongSection) {
-    *o << "V(kStartOfPointerFieldsOffset, 0) \\\n";
-  }
+bool IsPointerSection(FieldSectionType type) {
+  return type == FieldSectionType::kWeakSection ||
+         type == FieldSectionType::kStrongSection;
 }
 
-void PossiblyEndTagged(FieldSectionType* section,
-                       std::set<FieldSectionType>* completed_sections,
-                       std::stringstream* o) {
-  if (completed_sections->count(FieldSectionType::kWeakSection) != 0 &&
-      completed_sections->count(FieldSectionType::kStrongSection) != 0) {
-    *o << "V(kEndOfTaggedFieldsOffset, 0) \\\n";
+using FieldSections = base::Flags<FieldSectionType>;
+
+std::string ToString(FieldSectionType type) {
+  switch (type) {
+    case FieldSectionType::kNoSection:
+      return "NoSection";
+    case FieldSectionType::kWeakSection:
+      return "WeakFields";
+    case FieldSectionType::kStrongSection:
+      return "StrongFields";
+    case FieldSectionType::kScalarSection:
+      return "ScalarFields";
   }
+  UNREACHABLE();
 }
 
-void ProcessFieldInSection(FieldSectionType* section,
-                           std::set<FieldSectionType>* completed_sections,
-                           FieldSectionType field_section,
-                           std::stringstream* o) {
-  if (*section != FieldSectionType::kNoSection) {
-    if (*section != field_section) {
-      if (completed_sections->count(field_section) != 0) {
-        ReportError("reopening of weak, strong or scalar field section");
+class FieldOffsetsGenerator {
+ public:
+  explicit FieldOffsetsGenerator(const ClassType* type) : type_(type) {}
+
+  virtual void WriteField(const Field& f, const std::string& size_string) = 0;
+  virtual void WriteFieldOffsetGetter(const Field& f) = 0;
+  virtual void WriteMarker(const std::string& marker) = 0;
+
+  virtual ~FieldOffsetsGenerator() { CHECK(is_finished_); }
+
+  void RecordOffsetFor(const Field& f) {
+    CHECK(!is_finished_);
+    UpdateSection(f);
+
+    // Emit kHeaderSize before any indexed field.
+    if (f.index.has_value() && !header_size_emitted_) {
+      WriteMarker("kHeaderSize");
+      header_size_emitted_ = true;
+    }
+
+    // We don't know statically how much space an indexed field takes, so report
+    // it as zero.
+    std::string size_string = "0";
+    if (!f.index.has_value()) {
+      size_t field_size;
+      std::tie(field_size, size_string) = f.GetFieldSizeInformation();
+    }
+    if (f.offset.has_value()) {
+      WriteField(f, size_string);
+    } else {
+      WriteFieldOffsetGetter(f);
+    }
+  }
+
+  void Finish() {
+    End(current_section_);
+    if (!(completed_sections_ & FieldSectionType::kWeakSection)) {
+      Begin(FieldSectionType::kWeakSection);
+      End(FieldSectionType::kWeakSection);
+    }
+    if (!(completed_sections_ & FieldSectionType::kStrongSection)) {
+      Begin(FieldSectionType::kStrongSection);
+      End(FieldSectionType::kStrongSection);
+    }
+    is_finished_ = true;
+
+    // In the presence of indexed fields, we already emitted kHeaderSize before
+    // the indexed field.
+    if (!type_->IsShape() && !header_size_emitted_) {
+      WriteMarker("kHeaderSize");
+    }
+    if (!type_->IsAbstract() && type_->HasStaticSize()) {
+      WriteMarker("kSize");
+    }
+  }
+
+ protected:
+  const ClassType* type_;
+
+ private:
+  FieldSectionType GetSectionFor(const Field& f) {
+    const Type* field_type = f.name_and_type.type;
+    if (field_type == TypeOracle::GetVoidType()) {
+      // Allow void type for marker constants of size zero.
+      return current_section_;
+    }
+    StructType::Classification struct_contents =
+        StructType::ClassificationFlag::kEmpty;
+    if (auto field_as_struct = field_type->StructSupertype()) {
+      struct_contents = (*field_as_struct)->ClassifyContents();
+    }
+    if ((struct_contents & StructType::ClassificationFlag::kStrongTagged) &&
+        (struct_contents & StructType::ClassificationFlag::kWeakTagged)) {
+      // It's okay for a struct to contain both strong and weak data. We'll just
+      // treat the whole thing as weak. This is required for DescriptorEntry.
+      struct_contents &= ~StructType::Classification(
+          StructType::ClassificationFlag::kStrongTagged);
+    }
+    bool struct_contains_tagged_fields =
+        (struct_contents & StructType::ClassificationFlag::kStrongTagged) ||
+        (struct_contents & StructType::ClassificationFlag::kWeakTagged);
+    if (struct_contains_tagged_fields &&
+        (struct_contents & StructType::ClassificationFlag::kUntagged)) {
+      // We can't declare what section a struct goes in if it has multiple
+      // categories of data within.
+      Error(
+          "Classes do not support fields which are structs containing both "
+          "tagged and untagged data.")
+          .Position(f.pos);
+    }
+    if ((field_type->IsSubtypeOf(TypeOracle::GetStrongTaggedType()) ||
+         struct_contents == StructType::ClassificationFlag::kStrongTagged) &&
+        !f.custom_weak_marking) {
+      return FieldSectionType::kStrongSection;
+    } else if (field_type->IsSubtypeOf(TypeOracle::GetTaggedType()) ||
+               struct_contains_tagged_fields) {
+      return FieldSectionType::kWeakSection;
+    } else {
+      return FieldSectionType::kScalarSection;
+    }
+  }
+  void UpdateSection(const Field& f) {
+    FieldSectionType type = GetSectionFor(f);
+    if (current_section_ == type) return;
+    if (IsPointerSection(type)) {
+      if (completed_sections_ & type) {
+        std::stringstream s;
+        s << "cannot declare field " << f.name_and_type.name << " in class "
+          << type_->name() << ", because section " << ToString(type)
+          << " to which it belongs has already been finished.";
+        Error(s.str()).Position(f.pos);
       }
-      completed_sections->insert(*section);
-      if (*section == FieldSectionType::kWeakSection) {
-        *o << "V(kEndOfWeakFieldsOffset, 0) \\\n";
-        PossiblyEndTagged(section, completed_sections, o);
-      } else if (*section == FieldSectionType::kStrongSection) {
-        *o << "V(kEndOfStrongFieldsOffset, 0) \\\n";
-        PossiblyEndTagged(section, completed_sections, o);
+    }
+    End(current_section_);
+    current_section_ = type;
+    Begin(current_section_);
+  }
+  void Begin(FieldSectionType type) {
+    DCHECK(type != FieldSectionType::kNoSection);
+    if (!IsPointerSection(type)) return;
+    WriteMarker("kStartOf" + ToString(type) + "Offset");
+  }
+  void End(FieldSectionType type) {
+    if (!IsPointerSection(type)) return;
+    completed_sections_ |= type;
+    WriteMarker("kEndOf" + ToString(type) + "Offset");
+  }
+
+  FieldSectionType current_section_ = FieldSectionType::kNoSection;
+  FieldSections completed_sections_ = FieldSectionType::kNoSection;
+  bool is_finished_ = false;
+  bool header_size_emitted_ = false;
+};
+
+void GenerateClassExport(const ClassType* type, std::ostream& header,
+                         std::ostream& inl_header) {
+  const ClassType* super = type->GetSuperClass();
+  std::string parent = "TorqueGenerated" + type->name() + "<" + type->name() +
+                       ", " + super->name() + ">";
+  header << "class " << type->name() << " : public " << parent << " {\n";
+  header << " public:\n";
+  if (type->ShouldGenerateBodyDescriptor()) {
+    header << "  class BodyDescriptor;\n";
+  }
+  header << "  TQ_OBJECT_CONSTRUCTORS(" << type->name() << ")\n";
+  header << "};\n\n";
+  inl_header << "TQ_OBJECT_CONSTRUCTORS_IMPL(" << type->name() << ")\n";
+}
+
+}  // namespace
+
+void ImplementationVisitor::GenerateVisitorLists(
+    const std::string& output_directory) {
+  std::stringstream header;
+  std::string file_name = "visitor-lists.h";
+  {
+    IncludeGuardScope include_guard(header, file_name);
+
+    header << "#define TORQUE_INSTANCE_TYPE_TO_BODY_DESCRIPTOR_LIST(V)\\\n";
+    for (const ClassType* type : TypeOracle::GetClasses()) {
+      if (type->ShouldGenerateBodyDescriptor() && type->OwnInstanceType()) {
+        std::string type_name =
+            CapifyStringWithUnderscores(type->name()) + "_TYPE";
+        header << "V(" << type_name << "," << type->name() << ")\\\n";
+      }
+    }
+    header << "\n";
+
+    header << "#define TORQUE_DATA_ONLY_VISITOR_ID_LIST(V)\\\n";
+    for (const ClassType* type : TypeOracle::GetClasses()) {
+      if (type->ShouldGenerateBodyDescriptor() && type->HasNoPointerSlots()) {
+        header << "V(" << type->name() << ")\\\n";
+      }
+    }
+    header << "\n";
+
+    header << "#define TORQUE_POINTER_VISITOR_ID_LIST(V)\\\n";
+    for (const ClassType* type : TypeOracle::GetClasses()) {
+      if (type->ShouldGenerateBodyDescriptor() && !type->HasNoPointerSlots()) {
+        header << "V(" << type->name() << ")\\\n";
+      }
+    }
+    header << "\n";
+  }
+  const std::string output_header_path = output_directory + "/" + file_name;
+  WriteFile(output_header_path, header.str());
+}
+
+void ImplementationVisitor::GenerateBitFields(
+    const std::string& output_directory) {
+  std::stringstream header;
+  std::string file_name = "bit-fields.h";
+  {
+    IncludeGuardScope include_guard(header, file_name);
+    header << "#include \"src/base/bit-field.h\"\n\n";
+    NamespaceScope namespaces(header, {"v8", "internal"});
+
+    for (const auto& type : TypeOracle::GetBitFieldStructTypes()) {
+      bool all_single_bits = true;  // Track whether every field is one bit.
+
+      header << "#define DEFINE_TORQUE_GENERATED_"
+             << CapifyStringWithUnderscores(type->name()) << "() \\\n";
+      std::string type_name = type->GetConstexprGeneratedTypeName();
+      for (const auto& field : type->fields()) {
+        const char* suffix = field.num_bits == 1 ? "Bit" : "Bits";
+        all_single_bits = all_single_bits && field.num_bits == 1;
+        std::string field_type_name =
+            field.name_and_type.type->GetConstexprGeneratedTypeName();
+        header << "  using " << CamelifyString(field.name_and_type.name)
+               << suffix << " = base::BitField<" << field_type_name << ", "
+               << field.offset << ", " << field.num_bits << ", " << type_name
+               << ">; \\\n";
+      }
+
+      // If every field is one bit, we can also generate a convenient enum.
+      if (all_single_bits) {
+        header << "  enum Flag: " << type_name << " { \\\n";
+        header << "    kNone = 0, \\\n";
+        for (const auto& field : type->fields()) {
+          header << "    k" << CamelifyString(field.name_and_type.name) << " = "
+                 << type_name << "{1} << " << field.offset << ", \\\n";
+        }
+        header << "  }; \\\n";
+        header << "  using Flags = base::Flags<Flag>; \\\n";
+        header << "  static constexpr int kFlagCount = "
+               << type->fields().size() << "; \\\n";
+      }
+
+      header << "\n";
+    }
+  }
+  const std::string output_header_path = output_directory + "/" + file_name;
+  WriteFile(output_header_path, header.str());
+}
+
+namespace {
+
+class ClassFieldOffsetGenerator : public FieldOffsetsGenerator {
+ public:
+  ClassFieldOffsetGenerator(std::ostream& header, std::ostream& inline_header,
+                            const ClassType* type, std::string gen_name,
+                            const ClassType* parent)
+      : FieldOffsetsGenerator(type),
+        hdr_(header),
+        inl_(inline_header),
+        previous_field_end_((parent && parent->IsShape()) ? "P::kSize"
+                                                          : "P::kHeaderSize"),
+        gen_name_(gen_name) {}
+
+  void WriteField(const Field& f, const std::string& size_string) override {
+    hdr_ << "  // " << f.pos << "\n";
+    std::string field = "k" + CamelifyString(f.name_and_type.name) + "Offset";
+    std::string field_end = field + "End";
+    hdr_ << "  static constexpr int " << field << " = " << previous_field_end_
+         << ";\n";
+    hdr_ << "  static constexpr int " << field_end << " = " << field << " + "
+         << size_string << " - 1;\n";
+    previous_field_end_ = field_end + " + 1";
+  }
+
+  void WriteFieldOffsetGetter(const Field& f) override {
+    // A static constexpr int is more convenient than a getter if the offset is
+    // known.
+    DCHECK(!f.offset.has_value());
+
+    std::string function_name = CamelifyString(f.name_and_type.name) + "Offset";
+
+    std::vector<cpp::TemplateParameter> params = {cpp::TemplateParameter("D"),
+                                                  cpp::TemplateParameter("P")};
+    cpp::Class owner(std::move(params), gen_name_);
+
+    auto getter = cpp::Function::DefaultGetter("int", &owner, function_name);
+    getter.PrintDeclaration(hdr_);
+    getter.PrintDefinition(inl_, [&](std::ostream& stream) {
+      // Item 1 in a flattened slice is the offset.
+      stream << "  return static_cast<int>(std::get<1>("
+             << Callable::PrefixNameForCCOutput(type_->GetSliceMacroName(f))
+             << "(*static_cast<const D*>(this))));\n";
+    });
+  }
+  void WriteMarker(const std::string& marker) override {
+    hdr_ << "  static constexpr int " << marker << " = " << previous_field_end_
+         << ";\n";
+  }
+
+ private:
+  std::ostream& hdr_;
+  std::ostream& inl_;
+  std::string previous_field_end_;
+  std::string gen_name_;
+};
+
+class CppClassGenerator {
+ public:
+  CppClassGenerator(const ClassType* type, std::ostream& header,
+                    std::ostream& inl_header, std::ostream& impl)
+      : type_(type),
+        super_(type->GetSuperClass()),
+        name_(type->name()),
+        gen_name_("TorqueGenerated" + name_),
+        gen_name_T_(gen_name_ + "<D, P>"),
+        gen_name_I_(gen_name_ + "<" + name_ + ", " + super_->name() + ">"),
+        hdr_(header),
+        inl_(inl_header),
+        impl_(impl) {}
+  const std::string template_decl() const {
+    return "template <class D, class P>";
+  }
+
+  void GenerateClass();
+  void GenerateCppObjectDefinitionAsserts();
+
+ private:
+  SourcePosition Position();
+
+  void GenerateClassConstructors();
+
+  // Generates getter and setter runtime member functions for the given class
+  // field. Traverses depth-first through any nested struct fields to generate
+  // accessors for them also; struct_fields represents the stack of currently
+  // active struct fields.
+  void GenerateFieldAccessors(const Field& class_field,
+                              std::vector<const Field*>& struct_fields);
+  void EmitLoadFieldStatement(std::ostream& stream, const Field& class_field,
+                              std::vector<const Field*>& struct_fields);
+  void EmitStoreFieldStatement(std::ostream& stream, const Field& class_field,
+                               std::vector<const Field*>& struct_fields);
+
+  void GenerateClassCasts();
+
+  std::string GetFieldOffsetForAccessor(const Field& f);
+
+  // Gets the C++ type name that should be used in accessors for referring to
+  // the value of a class field.
+  std::string GetTypeNameForAccessor(const Field& f);
+
+  bool CanContainHeapObjects(const Type* t);
+
+  const ClassType* type_;
+  const ClassType* super_;
+  const std::string name_;
+  const std::string gen_name_;
+  const std::string gen_name_T_;
+  const std::string gen_name_I_;
+  std::ostream& hdr_;
+  std::ostream& inl_;
+  std::ostream& impl_;
+};
+
+base::Optional<std::vector<Field>> GetOrderedUniqueIndexFields(
+    const ClassType& type) {
+  std::vector<Field> result;
+  std::set<std::string> index_names;
+  for (const Field& field : type.ComputeAllFields()) {
+    if (field.index) {
+      auto name_and_type = ExtractSimpleFieldArraySize(type, field.index->expr);
+      if (!name_and_type) {
+        return base::nullopt;
+      }
+      index_names.insert(name_and_type->name);
+    }
+  }
+
+  for (const Field& field : type.ComputeAllFields()) {
+    if (index_names.count(field.name_and_type.name) != 0) {
+      result.push_back(field);
+    }
+  }
+
+  return result;
+}
+
+void CppClassGenerator::GenerateClass() {
+  // Is<name>_NonInline(HeapObject)
+  if (!type_->IsShape()) {
+    cpp::Function f("Is"s + name_ + "_NonInline");
+    f.SetDescription("Alias for HeapObject::Is"s + name_ +
+                     "() that avoids inlining.");
+    f.SetExport(true);
+    f.SetReturnType("bool");
+    f.AddParameter("HeapObject", "o");
+
+    f.PrintDeclaration(hdr_);
+    hdr_ << "\n";
+    f.PrintDefinition(impl_, [&](std::ostream& stream) {
+      stream << "  return o.Is" << name_ << "();\n";
+    });
+  }
+  hdr_ << "// Definition " << Position() << "\n";
+  hdr_ << template_decl() << "\n";
+  hdr_ << "class " << gen_name_ << " : public P {\n";
+  hdr_ << "  static_assert(\n"
+       << "      std::is_same<" << name_ << ", D>::value,\n"
+       << "      \"Use this class as direct base for " << name_ << ".\");\n";
+  hdr_ << "  static_assert(\n"
+       << "      std::is_same<" << super_->name() << ", P>::value,\n"
+       << "      \"Pass in " << super_->name()
+       << " as second template parameter for " << gen_name_ << ".\");\n\n";
+  hdr_ << " public: \n";
+  hdr_ << "  using Super = P;\n";
+  hdr_ << "  using TorqueGeneratedClass = " << gen_name_ << "<D,P>;\n\n";
+  if (!type_->ShouldExport() && !type_->IsExtern()) {
+    hdr_ << " protected: // not extern or @export\n";
+  }
+  for (const Field& f : type_->fields()) {
+    CurrentSourcePosition::Scope scope(f.pos);
+    std::vector<const Field*> struct_fields;
+    GenerateFieldAccessors(f, struct_fields);
+  }
+  if (!type_->ShouldExport() && !type_->IsExtern()) {
+    hdr_ << " public:\n";
+  }
+
+  GenerateClassCasts();
+
+  std::vector<cpp::TemplateParameter> templateArgs = {
+      cpp::TemplateParameter("D"), cpp::TemplateParameter("P")};
+  cpp::Class c(std::move(templateArgs), gen_name_);
+
+  if (type_->ShouldGeneratePrint()) {
+    hdr_ << "  DECL_PRINTER(" << name_ << ")\n\n";
+  }
+
+  if (type_->ShouldGenerateVerify()) {
+    IfDefScope hdr_scope(hdr_, "VERIFY_HEAP");
+    // V8_EXPORT_PRIVATE void Verify(Isolate*);
+    cpp::Function f(&c, name_ + "Verify");
+    f.SetExport();
+    f.SetReturnType("void");
+    f.AddParameter("Isolate*", "isolate");
+    f.PrintDeclaration(hdr_);
+
+    IfDefScope impl_scope(impl_, "VERIFY_HEAP");
+    impl_ << "\ntemplate <>\n";
+    impl_ << "void " << gen_name_I_ << "::" << name_
+          << "Verify(Isolate* isolate) {\n";
+    impl_ << "  TorqueGeneratedClassVerifiers::" << name_ << "Verify(" << name_
+          << "::cast(*this), "
+             "isolate);\n";
+    impl_ << "}\n\n";
+    impl_ << "\n";
+  }
+
+  hdr_ << "\n";
+  ClassFieldOffsetGenerator g(hdr_, inl_, type_, gen_name_,
+                              type_->GetSuperClass());
+  for (auto f : type_->fields()) {
+    CurrentSourcePosition::Scope scope(f.pos);
+    g.RecordOffsetFor(f);
+  }
+  g.Finish();
+  hdr_ << "\n";
+
+  auto index_fields = GetOrderedUniqueIndexFields(*type_);
+
+  if (!index_fields.has_value()) {
+    hdr_ << "  // SizeFor implementations not generated due to complex array "
+            "lengths\n\n";
+
+    const Field& last_field = type_->LastField();
+    std::string last_field_item_size =
+        std::get<1>(*SizeOf(last_field.name_and_type.type));
+
+    // int AllocatedSize() const
+    {
+      cpp::Function f =
+          cpp::Function::DefaultGetter("int", &c, "AllocatedSize");
+      f.PrintDeclaration(hdr_);
+
+      f.PrintDefinition(inl_, [&](std::ostream& stream) {
+        stream << "  auto slice = "
+               << Callable::PrefixNameForCCOutput(
+                      type_->GetSliceMacroName(last_field))
+               << "(*static_cast<const D*>(this));\n";
+        stream << "  return static_cast<int>(std::get<1>(slice)) + "
+               << last_field_item_size
+               << " * static_cast<int>(std::get<2>(slice));\n";
+      });
+    }
+  } else if (type_->ShouldGenerateBodyDescriptor() ||
+             (!type_->IsAbstract() &&
+              !type_->IsSubtypeOf(TypeOracle::GetJSObjectType()))) {
+    cpp::Function f(&c, "SizeFor");
+    f.SetReturnType("int32_t");
+    f.SetFlags(cpp::Function::kStatic | cpp::Function::kConstexpr |
+               cpp::Function::kV8Inline);
+    for (const Field& field : *index_fields) {
+      f.AddParameter("int", field.name_and_type.name);
+    }
+    f.PrintInlineDefinition(hdr_, [&](std::ostream& stream) {
+      if (index_fields->empty()) {
+        stream << "    DCHECK(kHeaderSize == kSize && kHeaderSize == "
+               << *type_->size().SingleValue() << ");\n";
+      }
+      stream << "    int32_t size = kHeaderSize;\n";
+      for (const Field& field : type_->ComputeAllFields()) {
+        if (field.index) {
+          auto index_name_and_type =
+              *ExtractSimpleFieldArraySize(*type_, field.index->expr);
+          stream << "    size += " << index_name_and_type.name << " * "
+                 << std::get<0>(field.GetFieldSizeInformation()) << ";\n";
+        }
+      }
+      if (type_->size().Alignment() < TargetArchitecture::TaggedSize()) {
+        stream << "    size = OBJECT_POINTER_ALIGN(size);\n";
+      }
+      stream << "    return size;\n";
+    });
+
+    // V8_INLINE int32_t AllocatedSize() const
+    {
+      cpp::Function allocated_size_f =
+          cpp::Function::DefaultGetter("int32_t", &c, "AllocatedSize");
+      allocated_size_f.SetFlag(cpp::Function::kV8Inline);
+      allocated_size_f.PrintInlineDefinition(hdr_, [&](std::ostream& stream) {
+        stream << "    return SizeFor(";
+        bool first = true;
+        for (auto field : *index_fields) {
+          if (!first) stream << ", ";
+          stream << "this->" << field.name_and_type.name << "()";
+          first = false;
+        }
+        stream << ");\n";
+      });
+    }
+  }
+
+  hdr_ << "  friend class Factory;\n\n";
+
+  GenerateClassConstructors();
+
+  hdr_ << "};\n\n";
+
+  if (type_->ShouldGenerateFullClassDefinition()) {
+    // If this class extends from another class which is defined in the same tq
+    // file, and that other class doesn't generate a full class definition, then
+    // the resulting .inc file would be uncompilable due to ordering
+    // requirements: the generated file must go before the hand-written
+    // definition of the base class, but it must also go after that same
+    // hand-written definition.
+    base::Optional<const ClassType*> parent = type_->parent()->ClassSupertype();
+    while (parent) {
+      if ((*parent)->ShouldGenerateCppClassDefinitions() &&
+          !(*parent)->ShouldGenerateFullClassDefinition() &&
+          (*parent)->AttributedToFile() == type_->AttributedToFile()) {
+        Error("Exported ", *type_,
+              " cannot be in the same file as its parent extern ", **parent);
+      }
+      parent = (*parent)->parent()->ClassSupertype();
+    }
+
+    GenerateClassExport(type_, hdr_, inl_);
+  }
+}
+
+void CppClassGenerator::GenerateCppObjectDefinitionAsserts() {
+  hdr_ << "// Definition " << Position() << "\n"
+       << template_decl() << "\n"
+       << "class " << gen_name_ << "Asserts {\n";
+
+  ClassFieldOffsetGenerator g(hdr_, inl_, type_, gen_name_,
+                              type_->GetSuperClass());
+  for (auto f : type_->fields()) {
+    CurrentSourcePosition::Scope scope(f.pos);
+    g.RecordOffsetFor(f);
+  }
+  g.Finish();
+  hdr_ << "\n";
+
+  for (auto f : type_->fields()) {
+    std::string field = "k" + CamelifyString(f.name_and_type.name) + "Offset";
+    std::string type = f.name_and_type.type->SimpleName();
+    hdr_ << "  static_assert(" << field << " == D::" << field << ",\n"
+         << "                \"Values of " << name_ << "::" << field
+         << " defined in Torque and C++ do not match\");\n"
+         << "  static_assert(StaticStringsEqual(\"" << type << "\", D::k"
+         << CamelifyString(f.name_and_type.name) << "TqFieldType),\n"
+         << "                \"Types of " << name_ << "::" << field
+         << " specified in Torque and C++ do not match\");\n";
+  }
+  hdr_ << "  static_assert(kSize == D::kSize);\n";
+
+  hdr_ << "};\n\n";
+}
+
+void CppClassGenerator::GenerateClassCasts() {
+  cpp::Class owner({cpp::TemplateParameter("D"), cpp::TemplateParameter("P")},
+                   gen_name_);
+  cpp::Function f(&owner, "cast");
+  f.SetFlags(cpp::Function::kV8Inline | cpp::Function::kStatic);
+  f.SetReturnType("D");
+  f.AddParameter("Object", "object");
+
+  // V8_INLINE static D cast(Object)
+  f.PrintDeclaration(hdr_);
+  f.PrintDefinition(inl_, [](std::ostream& stream) {
+    stream << "    return D(object.ptr());\n";
+  });
+  // V8_INLINE static D unchecked_cast(Object)
+  f.SetName("unchecked_cast");
+  f.PrintInlineDefinition(hdr_, [](std::ostream& stream) {
+    stream << "    return bit_cast<D>(object);\n";
+  });
+}
+
+SourcePosition CppClassGenerator::Position() { return type_->GetPosition(); }
+
+void CppClassGenerator::GenerateClassConstructors() {
+  const ClassType* typecheck_type = type_;
+  while (typecheck_type->IsShape()) {
+    typecheck_type = typecheck_type->GetSuperClass();
+
+    // Shapes have already been checked earlier to inherit from JSObject, so we
+    // should have found an appropriate type.
+    DCHECK(typecheck_type);
+  }
+
+  hdr_ << "  template <class DAlias = D>\n";
+  hdr_ << "  constexpr " << gen_name_ << "() : P() {\n";
+  hdr_ << "    static_assert(\n";
+  hdr_ << "        std::is_base_of<" << gen_name_ << ", DAlias>::value,\n";
+  hdr_ << "        \"class " << gen_name_
+       << " should be used as direct base for " << name_ << ".\");\n";
+  hdr_ << "  }\n\n";
+
+  hdr_ << " protected:\n";
+  hdr_ << "  inline explicit " << gen_name_ << "(Address ptr);\n";
+  hdr_ << "  // Special-purpose constructor for subclasses that have fast "
+          "paths where\n";
+  hdr_ << "  // their ptr() is a Smi.\n";
+  hdr_ << "  inline explicit " << gen_name_
+       << "(Address ptr, HeapObject::AllowInlineSmiStorage allow_smi);\n";
+
+  inl_ << "template<class D, class P>\n";
+  inl_ << "inline " << gen_name_T_ << "::" << gen_name_ << "(Address ptr)\n";
+  inl_ << "    : P(ptr) {\n";
+  inl_ << "  SLOW_DCHECK(Is" << typecheck_type->name()
+       << "_NonInline(*this));\n";
+  inl_ << "}\n";
+
+  inl_ << "template<class D, class P>\n";
+  inl_ << "inline " << gen_name_T_ << "::" << gen_name_
+       << "(Address ptr, HeapObject::AllowInlineSmiStorage allow_smi)\n";
+  inl_ << "    : P(ptr, allow_smi) {\n";
+  inl_ << "  SLOW_DCHECK("
+       << "(allow_smi == HeapObject::AllowInlineSmiStorage::kAllowBeingASmi"
+          " && this->IsSmi()) || Is"
+       << typecheck_type->name() << "_NonInline(*this));\n";
+  inl_ << "}\n";
+}
+
+namespace {
+std::string GenerateRuntimeTypeCheck(const Type* type,
+                                     const std::string& value) {
+  bool maybe_object = !type->IsSubtypeOf(TypeOracle::GetStrongTaggedType());
+  std::stringstream type_check;
+  bool at_start = true;
+  // If weak pointers are allowed, then start by checking for a cleared value.
+  if (maybe_object) {
+    type_check << value << ".IsCleared()";
+    at_start = false;
+  }
+  for (const TypeChecker& runtime_type : type->GetTypeCheckers()) {
+    if (!at_start) type_check << " || ";
+    at_start = false;
+    if (maybe_object) {
+      bool strong = runtime_type.weak_ref_to.empty();
+      if (strong && runtime_type.type == WEAK_HEAP_OBJECT) {
+        // Rather than a generic Weak<T>, this is the basic type WeakHeapObject.
+        // We can't validate anything more about the type of the object pointed
+        // to, so just check that it's weak.
+        type_check << value << ".IsWeak()";
+      } else {
+        type_check << "(" << (strong ? "!" : "") << value << ".IsWeak() && "
+                   << value << ".GetHeapObjectOrSmi().Is"
+                   << (strong ? runtime_type.type : runtime_type.weak_ref_to)
+                   << "())";
+      }
+    } else {
+      type_check << value << ".Is" << runtime_type.type << "()";
+    }
+  }
+  return type_check.str();
+}
+
+void GenerateBoundsDCheck(std::ostream& os, const std::string& index,
+                          const ClassType* type, const Field& f) {
+  os << "  DCHECK_GE(" << index << ", 0);\n";
+  std::string length_expression;
+  if (base::Optional<NameAndType> array_length =
+          ExtractSimpleFieldArraySize(*type, f.index->expr)) {
+    length_expression = "this ->" + array_length->name + "()";
+  } else {
+    // The length is element 2 in the flattened field slice.
+    length_expression =
+        "static_cast<int>(std::get<2>(" +
+        Callable::PrefixNameForCCOutput(type->GetSliceMacroName(f)) +
+        "(*static_cast<const D*>(this))))";
+  }
+  os << "  DCHECK_LT(" << index << ", " << length_expression << ");\n";
+}
+
+bool CanGenerateFieldAccessors(const Type* field_type) {
+  // float64_or_hole should be treated like float64. For now, we don't need it.
+  // TODO(v8:10391) Generate accessors for external pointers.
+  return field_type != TypeOracle::GetVoidType() &&
+         field_type != TypeOracle::GetFloat64OrHoleType() &&
+         !field_type->IsSubtypeOf(TypeOracle::GetExternalPointerType());
+}
+}  // namespace
+
+// TODO(sigurds): Keep in sync with DECL_ACCESSORS and ACCESSORS macro.
+void CppClassGenerator::GenerateFieldAccessors(
+    const Field& class_field, std::vector<const Field*>& struct_fields) {
+  const Field& innermost_field =
+      struct_fields.empty() ? class_field : *struct_fields.back();
+  const Type* field_type = innermost_field.name_and_type.type;
+  if (!CanGenerateFieldAccessors(field_type)) return;
+
+  if (const StructType* struct_type = StructType::DynamicCast(field_type)) {
+    struct_fields.resize(struct_fields.size() + 1);
+    for (const Field& struct_field : struct_type->fields()) {
+      struct_fields[struct_fields.size() - 1] = &struct_field;
+      GenerateFieldAccessors(class_field, struct_fields);
+    }
+    struct_fields.resize(struct_fields.size() - 1);
+    return;
+  }
+
+  bool indexed = class_field.index && !class_field.index->optional;
+  std::string type_name = GetTypeNameForAccessor(innermost_field);
+  bool can_contain_heap_objects = CanContainHeapObjects(field_type);
+
+  // Assemble an accessor name by accumulating together all of the nested field
+  // names.
+  std::string name = class_field.name_and_type.name;
+  for (const Field* nested_struct_field : struct_fields) {
+    name += "_" + nested_struct_field->name_and_type.name;
+  }
+
+  // Generate declarations in header.
+  if (can_contain_heap_objects && !field_type->IsClassType() &&
+      !field_type->IsStructType() &&
+      field_type != TypeOracle::GetObjectType()) {
+    hdr_ << "  // Torque type: " << field_type->ToString() << "\n";
+  }
+
+  std::vector<cpp::TemplateParameter> templateParameters = {
+      cpp::TemplateParameter("D"), cpp::TemplateParameter("P")};
+  cpp::Class owner(std::move(templateParameters), gen_name_);
+
+  // getter
+  {
+    auto getter = cpp::Function::DefaultGetter(type_name, &owner, name);
+    if (indexed) {
+      getter.AddParameter("int", "i");
+    }
+    const char* tag_argument;
+    switch (class_field.read_synchronization) {
+      case FieldSynchronization::kNone:
+        tag_argument = "";
+        break;
+      case FieldSynchronization::kRelaxed:
+        getter.AddParameter("RelaxedLoadTag");
+        tag_argument = ", kRelaxedLoad";
+        break;
+      case FieldSynchronization::kAcquireRelease:
+        getter.AddParameter("AcquireLoadTag");
+        tag_argument = ", kAcquireLoad";
+        break;
+    }
+
+    getter.PrintDeclaration(hdr_);
+
+    // For tagged data, generate the extra getter that derives an
+    // PtrComprCageBase from the current object's pointer.
+    if (can_contain_heap_objects) {
+      getter.PrintDefinition(inl_, [&](auto& stream) {
+        stream
+            << "  PtrComprCageBase cage_base = GetPtrComprCageBase(*this);\n";
+        stream << "  return " << gen_name_ << "::" << name << "(cage_base"
+               << (indexed ? ", i" : "") << tag_argument << ");\n";
+      });
+
+      getter.InsertParameter(0, "PtrComprCageBase", "cage_base");
+      getter.PrintDeclaration(hdr_);
+    }
+
+    getter.PrintDefinition(inl_, [&](auto& stream) {
+      stream << "  " << type_name << " value;\n";
+      EmitLoadFieldStatement(stream, class_field, struct_fields);
+      stream << "  return value;\n";
+    });
+  }
+
+  // setter
+  {
+    auto setter = cpp::Function::DefaultSetter(
+        &owner, std::string("set_") + name, type_name, "value");
+    if (indexed) {
+      setter.InsertParameter(0, "int", "i");
+    }
+    switch (class_field.write_synchronization) {
+      case FieldSynchronization::kNone:
+        break;
+      case FieldSynchronization::kRelaxed:
+        setter.AddParameter("RelaxedStoreTag");
+        break;
+      case FieldSynchronization::kAcquireRelease:
+        setter.AddParameter("ReleaseStoreTag");
+        break;
+    }
+    if (can_contain_heap_objects) {
+      setter.AddParameter("WriteBarrierMode", "mode", "UPDATE_WRITE_BARRIER");
+    }
+    setter.PrintDeclaration(hdr_);
+
+    setter.PrintDefinition(inl_, [&](auto& stream) {
+      EmitStoreFieldStatement(stream, class_field, struct_fields);
+    });
+  }
+
+  hdr_ << "\n";
+}
+
+std::string CppClassGenerator::GetFieldOffsetForAccessor(const Field& f) {
+  if (f.offset.has_value()) {
+    return "k" + CamelifyString(f.name_and_type.name) + "Offset";
+  }
+  return CamelifyString(f.name_and_type.name) + "Offset()";
+}
+
+std::string CppClassGenerator::GetTypeNameForAccessor(const Field& f) {
+  const Type* field_type = f.name_and_type.type;
+  if (!field_type->IsSubtypeOf(TypeOracle::GetTaggedType())) {
+    const Type* constexpr_version = field_type->ConstexprVersion();
+    if (!constexpr_version) {
+      Error("Field accessor for ", type_->name(), ":: ", f.name_and_type.name,
+            " cannot be generated because its type ", *field_type,
+            " is neither a subclass of Object nor does the type have a "
+            "constexpr "
+            "version.")
+          .Position(f.pos)
+          .Throw();
+    }
+    return constexpr_version->GetGeneratedTypeName();
+  }
+  if (field_type->IsSubtypeOf(TypeOracle::GetSmiType())) {
+    // Follow the convention to create Smi accessors with type int.
+    return "int";
+  }
+  return field_type->UnhandlifiedCppTypeName();
+}
+
+bool CppClassGenerator::CanContainHeapObjects(const Type* t) {
+  return t->IsSubtypeOf(TypeOracle::GetTaggedType()) &&
+         !t->IsSubtypeOf(TypeOracle::GetSmiType());
+}
+
+void CppClassGenerator::EmitLoadFieldStatement(
+    std::ostream& stream, const Field& class_field,
+    std::vector<const Field*>& struct_fields) {
+  const Field& innermost_field =
+      struct_fields.empty() ? class_field : *struct_fields.back();
+  const Type* field_type = innermost_field.name_and_type.type;
+  std::string type_name = GetTypeNameForAccessor(innermost_field);
+  const std::string class_field_size =
+      std::get<1>(class_field.GetFieldSizeInformation());
+
+  // field_offset contains both the offset from the beginning of the object to
+  // the class field and the combined offsets of any nested struct fields
+  // within, but not the index adjustment.
+  std::string field_offset = GetFieldOffsetForAccessor(class_field);
+  for (const Field* nested_struct_field : struct_fields) {
+    field_offset += " + " + std::to_string(*nested_struct_field->offset);
+  }
+
+  std::string offset = field_offset;
+  if (class_field.index) {
+    const char* index = class_field.index->optional ? "0" : "i";
+    GenerateBoundsDCheck(stream, index, type_, class_field);
+    stream << "  int offset = " << field_offset << " + " << index << " * "
+           << class_field_size << ";\n";
+    offset = "offset";
+  }
+
+  stream << "  value = ";
+
+  if (!field_type->IsSubtypeOf(TypeOracle::GetTaggedType())) {
+    if (class_field.read_synchronization ==
+        FieldSynchronization::kAcquireRelease) {
+      ReportError("Torque doesn't support @cppAcquireRead on untagged data");
+    } else if (class_field.read_synchronization ==
+               FieldSynchronization::kRelaxed) {
+      ReportError("Torque doesn't support @cppRelaxedRead on untagged data");
+    }
+    stream << "this->template ReadField<" << type_name << ">(" << offset
+           << ");\n";
+  } else {
+    const char* load;
+    switch (class_field.read_synchronization) {
+      case FieldSynchronization::kNone:
+        load = "load";
+        break;
+      case FieldSynchronization::kRelaxed:
+        load = "Relaxed_Load";
+        break;
+      case FieldSynchronization::kAcquireRelease:
+        load = "Acquire_Load";
+        break;
+    }
+    bool is_smi = field_type->IsSubtypeOf(TypeOracle::GetSmiType());
+    const std::string load_type = is_smi ? "Smi" : type_name;
+    const char* postfix = is_smi ? ".value()" : "";
+    const char* optional_cage_base = is_smi ? "" : "cage_base, ";
+
+    stream << "TaggedField<" << load_type << ">::" << load << "("
+           << optional_cage_base << "*this, " << offset << ")" << postfix
+           << ";\n";
+  }
+
+  if (CanContainHeapObjects(field_type)) {
+    stream << "  DCHECK(" << GenerateRuntimeTypeCheck(field_type, "value")
+           << ");\n";
+  }
+}
+
+void CppClassGenerator::EmitStoreFieldStatement(
+    std::ostream& stream, const Field& class_field,
+    std::vector<const Field*>& struct_fields) {
+  const Field& innermost_field =
+      struct_fields.empty() ? class_field : *struct_fields.back();
+  const Type* field_type = innermost_field.name_and_type.type;
+  std::string type_name = GetTypeNameForAccessor(innermost_field);
+  const std::string class_field_size =
+      std::get<1>(class_field.GetFieldSizeInformation());
+
+  // field_offset contains both the offset from the beginning of the object to
+  // the class field and the combined offsets of any nested struct fields
+  // within, but not the index adjustment.
+  std::string field_offset = GetFieldOffsetForAccessor(class_field);
+  for (const Field* nested_struct_field : struct_fields) {
+    field_offset += " + " + std::to_string(*nested_struct_field->offset);
+  }
+
+  std::string offset = field_offset;
+  if (class_field.index) {
+    const char* index = class_field.index->optional ? "0" : "i";
+    GenerateBoundsDCheck(stream, index, type_, class_field);
+    stream << "  int offset = " << field_offset << " + " << index << " * "
+           << class_field_size << ";\n";
+    offset = "offset";
+  }
+
+  if (!field_type->IsSubtypeOf(TypeOracle::GetTaggedType())) {
+    stream << "  this->template WriteField<" << type_name << ">(" << offset
+           << ", value);\n";
+  } else {
+    bool strong_pointer = field_type->IsSubtypeOf(TypeOracle::GetObjectType());
+    bool is_smi = field_type->IsSubtypeOf(TypeOracle::GetSmiType());
+    const char* write_macro;
+    if (!strong_pointer) {
+      if (class_field.write_synchronization ==
+          FieldSynchronization::kAcquireRelease) {
+        ReportError("Torque doesn't support @releaseWrite on weak fields");
+      }
+      write_macro = "RELAXED_WRITE_WEAK_FIELD";
+    } else {
+      switch (class_field.write_synchronization) {
+        case FieldSynchronization::kNone:
+          write_macro = "WRITE_FIELD";
+          break;
+        case FieldSynchronization::kRelaxed:
+          write_macro = "RELAXED_WRITE_FIELD";
+          break;
+        case FieldSynchronization::kAcquireRelease:
+          write_macro = "RELEASE_WRITE_FIELD";
+          break;
+      }
+    }
+    const std::string value_to_write = is_smi ? "Smi::FromInt(value)" : "value";
+
+    if (!is_smi) {
+      stream << "  SLOW_DCHECK("
+             << GenerateRuntimeTypeCheck(field_type, "value") << ");\n";
+    }
+    stream << "  " << write_macro << "(*this, " << offset << ", "
+           << value_to_write << ");\n";
+    if (!is_smi) {
+      const char* write_barrier = strong_pointer
+                                      ? "CONDITIONAL_WRITE_BARRIER"
+                                      : "CONDITIONAL_WEAK_WRITE_BARRIER";
+      stream << "  " << write_barrier << "(*this, " << offset
+             << ", value, mode);\n";
+    }
+  }
+}
+
+void GenerateStructLayoutDescription(std::ostream& header,
+                                     const StructType* type) {
+  header << "struct TorqueGenerated" << CamelifyString(type->name())
+         << "Offsets {\n";
+  for (const Field& field : type->fields()) {
+    header << "  static constexpr int k"
+           << CamelifyString(field.name_and_type.name)
+           << "Offset = " << *field.offset << ";\n";
+  }
+  header << "  static constexpr int kSize = " << type->PackedSize() << ";\n";
+  header << "};\n\n";
+}
+
+}  // namespace
+
+void ImplementationVisitor::GenerateClassDefinitions(
+    const std::string& output_directory) {
+  std::stringstream factory_header;
+  std::stringstream factory_impl;
+  std::string factory_basename = "factory";
+
+  std::stringstream forward_declarations;
+  std::string forward_declarations_filename = "class-forward-declarations.h";
+
+  {
+    factory_impl << "#include \"src/heap/factory-base.h\"\n";
+    factory_impl << "#include \"src/heap/factory-base-inl.h\"\n";
+    factory_impl << "#include \"src/heap/heap.h\"\n";
+    factory_impl << "#include \"src/heap/heap-inl.h\"\n";
+    factory_impl << "#include \"src/execution/isolate.h\"\n";
+    factory_impl << "#include "
+                    "\"src/objects/all-objects-inl.h\"\n\n";
+    NamespaceScope factory_impl_namespaces(factory_impl, {"v8", "internal"});
+    factory_impl << "\n";
+
+    IncludeGuardScope include_guard(forward_declarations,
+                                    forward_declarations_filename);
+    NamespaceScope forward_declarations_namespaces(forward_declarations,
+                                                   {"v8", "internal"});
+
+    std::set<const StructType*, TypeLess> structs_used_in_classes;
+
+    // Emit forward declarations.
+    for (const ClassType* type : TypeOracle::GetClasses()) {
+      CurrentSourcePosition::Scope position_activator(type->GetPosition());
+      auto& streams = GlobalContext::GeneratedPerFile(type->AttributedToFile());
+      std::ostream& header = streams.class_definition_headerfile;
+      std::string name = type->ShouldGenerateCppClassDefinitions()
+                             ? type->name()
+                             : type->GetGeneratedTNodeTypeName();
+      if (type->ShouldGenerateCppClassDefinitions()) {
+        header << "class " << name << ";\n";
+      }
+      forward_declarations << "class " << name << ";\n";
+    }
+
+    for (const ClassType* type : TypeOracle::GetClasses()) {
+      CurrentSourcePosition::Scope position_activator(type->GetPosition());
+      auto& streams = GlobalContext::GeneratedPerFile(type->AttributedToFile());
+      std::ostream& header = streams.class_definition_headerfile;
+      std::ostream& inline_header = streams.class_definition_inline_headerfile;
+      std::ostream& implementation = streams.class_definition_ccfile;
+
+      if (type->ShouldGenerateCppClassDefinitions()) {
+        CppClassGenerator g(type, header, inline_header, implementation);
+        g.GenerateClass();
+      } else if (type->ShouldGenerateCppObjectDefinitionAsserts()) {
+        CppClassGenerator g(type, header, inline_header, implementation);
+        g.GenerateCppObjectDefinitionAsserts();
+      }
+      for (const Field& f : type->fields()) {
+        const Type* field_type = f.name_and_type.type;
+        if (auto field_as_struct = field_type->StructSupertype()) {
+          structs_used_in_classes.insert(*field_as_struct);
+        }
+      }
+      if (type->ShouldGenerateFactoryFunction()) {
+        std::string return_type = type->HandlifiedCppTypeName();
+        std::string function_name = "New" + type->name();
+        std::stringstream parameters;
+        for (const Field& f : type->ComputeAllFields()) {
+          if (f.name_and_type.name == "map") continue;
+          if (!f.index) {
+            std::string type_string =
+                f.name_and_type.type->HandlifiedCppTypeName();
+            parameters << type_string << " " << f.name_and_type.name << ", ";
+          }
+        }
+        parameters << "AllocationType allocation_type";
+
+        factory_header << return_type << " " << function_name << "("
+                       << parameters.str() << ");\n";
+        factory_impl << "template <typename Impl>\n";
+        factory_impl << return_type
+                     << " TorqueGeneratedFactory<Impl>::" << function_name
+                     << "(" << parameters.str() << ") {\n";
+
+        factory_impl << " int size = ";
+        const ClassType* super = type->GetSuperClass();
+        std::string gen_name = "TorqueGenerated" + type->name();
+        std::string gen_name_T =
+            gen_name + "<" + type->name() + ", " + super->name() + ">";
+        factory_impl << gen_name_T << "::SizeFor(";
+
+        bool first = true;
+        auto index_fields = GetOrderedUniqueIndexFields(*type);
+        CHECK(index_fields.has_value());
+        for (auto index_field : *index_fields) {
+          if (!first) {
+            factory_impl << ", ";
+          }
+          factory_impl << index_field.name_and_type.name;
+          first = false;
+        }
+
+        factory_impl << ");\n";
+        factory_impl << "  Map map = factory()->read_only_roots()."
+                     << SnakeifyString(type->name()) << "_map();";
+        factory_impl << "  HeapObject raw_object =\n";
+        factory_impl << "    factory()->AllocateRawWithImmortalMap(size, "
+                        "allocation_type, map);\n";
+        factory_impl << "  " << type->UnhandlifiedCppTypeName()
+                     << " result = " << type->UnhandlifiedCppTypeName()
+                     << "::cast(raw_object);\n";
+        factory_impl << "  DisallowGarbageCollection no_gc;";
+        factory_impl << "  WriteBarrierMode write_barrier_mode =\n"
+                     << "     allocation_type == AllocationType::kYoung\n"
+                     << "     ? SKIP_WRITE_BARRIER : UPDATE_WRITE_BARRIER;\n"
+                     << "  USE(write_barrier_mode);\n";
+
+        for (const Field& f : type->ComputeAllFields()) {
+          if (f.name_and_type.name == "map") continue;
+          if (!f.index) {
+            factory_impl << "  result.TorqueGeneratedClass::set_"
+                         << SnakeifyString(f.name_and_type.name) << "(";
+            if (f.name_and_type.type->IsSubtypeOf(
+                    TypeOracle::GetTaggedType()) &&
+                !f.name_and_type.type->IsSubtypeOf(TypeOracle::GetSmiType())) {
+              factory_impl << "*" << f.name_and_type.name
+                           << ", write_barrier_mode";
+            } else {
+              factory_impl << f.name_and_type.name;
+            }
+            factory_impl << ");\n";
+          }
+        }
+
+        factory_impl << "  return handle(result, factory()->isolate());\n";
+        factory_impl << "}\n\n";
+
+        factory_impl << "template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) "
+                     << return_type
+                     << "TorqueGeneratedFactory<Factory>::" << function_name
+                     << "(" << parameters.str() << ");\n";
+        factory_impl << "template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) "
+                     << return_type << "TorqueGeneratedFactory<LocalFactory>::"
+                     << function_name << "(" << parameters.str() << ");\n";
+
+        factory_impl << "\n\n";
+      }
+    }
+
+    for (const StructType* type : structs_used_in_classes) {
+      CurrentSourcePosition::Scope position_activator(type->GetPosition());
+      std::ostream& header =
+          GlobalContext::GeneratedPerFile(type->GetPosition().source)
+              .class_definition_headerfile;
+      if (type != TypeOracle::GetFloat64OrHoleType()) {
+        GenerateStructLayoutDescription(header, type);
       }
     }
   }
-  if (*section != field_section) {
-    if (field_section == FieldSectionType::kWeakSection) {
-      PossiblyStartTagged(section, completed_sections, o);
-      *o << "V(kStartOfWeakFieldsOffset, 0) \\\n";
-    } else if (field_section == FieldSectionType::kStrongSection) {
-      PossiblyStartTagged(section, completed_sections, o);
-      *o << "V(kStartOfStrongFieldsOffset, 0) \\\n";
-    }
-  }
-  *section = field_section;
+  WriteFile(output_directory + "/" + factory_basename + ".inc",
+            factory_header.str());
+  WriteFile(output_directory + "/" + factory_basename + ".cc",
+            factory_impl.str());
+  WriteFile(output_directory + "/" + forward_declarations_filename,
+            forward_declarations.str());
 }
 
-void CompleteFieldSection(FieldSectionType* section,
-                          std::set<FieldSectionType>* completed_sections,
-                          FieldSectionType field_section,
-                          std::stringstream* o) {
-  if (completed_sections->count(field_section) == 0) {
-    ProcessFieldInSection(section, completed_sections, field_section, o);
-    ProcessFieldInSection(section, completed_sections,
-                          FieldSectionType::kNoSection, o);
+namespace {
+void GeneratePrintDefinitionsForClass(std::ostream& impl, const ClassType* type,
+                                      const std::string& gen_name,
+                                      const std::string& gen_name_T,
+                                      const std::string template_params) {
+  impl << template_params << "\n";
+  impl << "void " << gen_name_T << "::" << type->name()
+       << "Print(std::ostream& os) {\n";
+  impl << "  this->PrintHeader(os, \"" << type->name() << "\");\n";
+  auto hierarchy = type->GetHierarchy();
+  std::map<std::string, const AggregateType*> field_names;
+  for (const AggregateType* aggregate_type : hierarchy) {
+    for (const Field& f : aggregate_type->fields()) {
+      if (f.name_and_type.name == "map" || f.index.has_value() ||
+          !CanGenerateFieldAccessors(f.name_and_type.type)) {
+        continue;
+      }
+      std::string getter = f.name_and_type.name;
+      if (aggregate_type != type) {
+        // We must call getters directly on the class that provided them,
+        // because a subclass could have hidden them.
+        getter = aggregate_type->name() + "::TorqueGeneratedClass::" + getter;
+      }
+      if (f.name_and_type.type->IsSubtypeOf(TypeOracle::GetSmiType()) ||
+          !f.name_and_type.type->IsSubtypeOf(TypeOracle::GetTaggedType())) {
+        impl << "  os << \"\\n - " << f.name_and_type.name << ": \" << ";
+        if (f.name_and_type.type->StructSupertype()) {
+          // TODO(turbofan): Print struct fields too.
+          impl << "\" <struct field printing still unimplemented>\";\n";
+        } else {
+          impl << "this->" << getter;
+          switch (f.read_synchronization) {
+            case FieldSynchronization::kNone:
+              impl << "();\n";
+              break;
+            case FieldSynchronization::kRelaxed:
+              impl << "(kRelaxedLoad);\n";
+              break;
+            case FieldSynchronization::kAcquireRelease:
+              impl << "(kAcquireLoad);\n";
+              break;
+          }
+        }
+      } else {
+        impl << "  os << \"\\n - " << f.name_and_type.name << ": \" << "
+             << "Brief(this->" << getter;
+        switch (f.read_synchronization) {
+          case FieldSynchronization::kNone:
+            impl << "());\n";
+            break;
+          case FieldSynchronization::kRelaxed:
+            impl << "(kRelaxedLoad));\n";
+            break;
+          case FieldSynchronization::kAcquireRelease:
+            impl << "(kAcquireLoad));\n";
+            break;
+        }
+      }
+    }
+  }
+  impl << "  os << '\\n';\n";
+  impl << "}\n\n";
+}
+}  // namespace
+
+void ImplementationVisitor::GeneratePrintDefinitions(
+    const std::string& output_directory) {
+  std::stringstream impl;
+  std::string file_name = "objects-printer.cc";
+  {
+    IfDefScope object_print(impl, "OBJECT_PRINT");
+
+    impl << "#include <iosfwd>\n\n";
+    impl << "#include \"src/objects/all-objects-inl.h\"\n\n";
+
+    NamespaceScope impl_namespaces(impl, {"v8", "internal"});
+
+    for (const ClassType* type : TypeOracle::GetClasses()) {
+      if (!type->ShouldGeneratePrint()) continue;
+      DCHECK(type->ShouldGenerateCppClassDefinitions());
+      const ClassType* super = type->GetSuperClass();
+      std::string gen_name = "TorqueGenerated" + type->name();
+      std::string gen_name_T =
+          gen_name + "<" + type->name() + ", " + super->name() + ">";
+      std::string template_decl = "template <>";
+      GeneratePrintDefinitionsForClass(impl, type, gen_name, gen_name_T,
+                                       template_decl);
+    }
+  }
+
+  std::string new_contents(impl.str());
+  WriteFile(output_directory + "/" + file_name, new_contents);
+}
+
+base::Optional<std::string> MatchSimpleBodyDescriptor(const ClassType* type) {
+  std::vector<ObjectSlotKind> slots = type->ComputeHeaderSlotKinds();
+  if (!type->HasStaticSize()) {
+    slots.push_back(*type->ComputeArraySlotKind());
+  }
+
+  // Skip the map slot.
+  size_t i = 1;
+  while (i < slots.size() && slots[i] == ObjectSlotKind::kNoPointer) ++i;
+  if (i == slots.size()) return "DataOnlyBodyDescriptor";
+  bool has_weak_pointers = false;
+  size_t start_index = i;
+  for (; i < slots.size(); ++i) {
+    if (slots[i] == ObjectSlotKind::kStrongPointer) {
+      continue;
+    } else if (slots[i] == ObjectSlotKind::kMaybeObjectPointer) {
+      has_weak_pointers = true;
+    } else if (slots[i] == ObjectSlotKind::kNoPointer) {
+      break;
+    } else {
+      return base::nullopt;
+    }
+  }
+  size_t end_index = i;
+  for (; i < slots.size(); ++i) {
+    if (slots[i] != ObjectSlotKind::kNoPointer) return base::nullopt;
+  }
+  size_t start_offset = start_index * TargetArchitecture::TaggedSize();
+  size_t end_offset = end_index * TargetArchitecture::TaggedSize();
+  // We pick a suffix-range body descriptor even in cases where the object size
+  // is fixed, to reduce the amount of code executed for object visitation.
+  if (end_index == slots.size()) {
+    return ToString("SuffixRange", has_weak_pointers ? "Weak" : "",
+                    "BodyDescriptor<", start_offset, ">");
+  }
+  if (!has_weak_pointers) {
+    return ToString("FixedRangeBodyDescriptor<", start_offset, ", ", end_offset,
+                    ">");
+  }
+  return base::nullopt;
+}
+
+void ImplementationVisitor::GenerateBodyDescriptors(
+    const std::string& output_directory) {
+  std::string file_name = "objects-body-descriptors-inl.inc";
+  std::stringstream h_contents;
+
+    for (const ClassType* type : TypeOracle::GetClasses()) {
+      std::string name = type->name();
+      if (!type->ShouldGenerateBodyDescriptor()) continue;
+
+      bool has_array_fields = !type->HasStaticSize();
+      std::vector<ObjectSlotKind> header_slot_kinds =
+          type->ComputeHeaderSlotKinds();
+      base::Optional<ObjectSlotKind> array_slot_kind =
+          type->ComputeArraySlotKind();
+      DCHECK_EQ(has_array_fields, array_slot_kind.has_value());
+
+      h_contents << "class " << name << "::BodyDescriptor final : public ";
+      if (auto descriptor_name = MatchSimpleBodyDescriptor(type)) {
+        h_contents << *descriptor_name << " {\n";
+        h_contents << " public:\n";
+      } else {
+        h_contents << "BodyDescriptorBase {\n";
+        h_contents << " public:\n";
+
+        h_contents << "  static bool IsValidSlot(Map map, HeapObject obj, int "
+                      "offset) {\n";
+        if (has_array_fields) {
+          h_contents << "    if (offset < kHeaderSize) {\n";
+        }
+        h_contents << "      bool valid_slots[] = {";
+        for (ObjectSlotKind slot : header_slot_kinds) {
+          h_contents << (slot != ObjectSlotKind::kNoPointer ? "1" : "0") << ",";
+        }
+        h_contents << "};\n"
+                   << "      return valid_slots[static_cast<unsigned "
+                      "int>(offset)/kTaggedSize];\n";
+        if (has_array_fields) {
+          h_contents << "    }\n";
+          bool array_is_tagged = *array_slot_kind != ObjectSlotKind::kNoPointer;
+          h_contents << "    return " << (array_is_tagged ? "true" : "false")
+                     << ";\n";
+        }
+        h_contents << "  }\n\n";
+
+        h_contents << "  template <typename ObjectVisitor>\n";
+        h_contents
+            << "  static inline void IterateBody(Map map, HeapObject obj, "
+               "int object_size, ObjectVisitor* v) {\n";
+
+        std::vector<ObjectSlotKind> slots = std::move(header_slot_kinds);
+        if (has_array_fields) slots.push_back(*array_slot_kind);
+
+        // Skip the map slot.
+        slots.erase(slots.begin());
+        size_t start_offset = TargetArchitecture::TaggedSize();
+
+        size_t end_offset = start_offset;
+        ObjectSlotKind section_kind;
+        for (size_t i = 0; i <= slots.size(); ++i) {
+          base::Optional<ObjectSlotKind> next_section_kind;
+          bool finished_section = false;
+          if (i == 0) {
+            next_section_kind = slots[i];
+          } else if (i < slots.size()) {
+            if (auto combined = Combine(section_kind, slots[i])) {
+              next_section_kind = *combined;
+            } else {
+              next_section_kind = slots[i];
+              finished_section = true;
+            }
+          } else {
+            finished_section = true;
+          }
+          if (finished_section) {
+            bool is_array_slot = i == slots.size() && has_array_fields;
+            bool multiple_slots =
+                is_array_slot ||
+                (end_offset - start_offset > TargetArchitecture::TaggedSize());
+            base::Optional<std::string> iterate_command;
+            switch (section_kind) {
+              case ObjectSlotKind::kStrongPointer:
+                iterate_command = "IteratePointer";
+                break;
+              case ObjectSlotKind::kMaybeObjectPointer:
+                iterate_command = "IterateMaybeWeakPointer";
+                break;
+              case ObjectSlotKind::kCustomWeakPointer:
+                iterate_command = "IterateCustomWeakPointer";
+                break;
+              case ObjectSlotKind::kNoPointer:
+                break;
+            }
+            if (iterate_command) {
+              if (multiple_slots) *iterate_command += "s";
+              h_contents << "    " << *iterate_command << "(obj, "
+                         << start_offset;
+              if (multiple_slots) {
+                h_contents << ", "
+                           << (i == slots.size() ? "object_size"
+                                                 : std::to_string(end_offset));
+              }
+              h_contents << ", v);\n";
+            }
+            start_offset = end_offset;
+          }
+          if (i < slots.size()) section_kind = *next_section_kind;
+          end_offset += TargetArchitecture::TaggedSize();
+        }
+
+        h_contents << "  }\n\n";
+      }
+
+      h_contents
+          << "  static inline int SizeOf(Map map, HeapObject raw_object) {\n";
+      if (type->size().SingleValue()) {
+        h_contents << "    return " << *type->size().SingleValue() << ";\n";
+      } else {
+        // We use an unchecked_cast here because this is used for concurrent
+        // marking, where we shouldn't re-read the map.
+        h_contents << "    return " << name
+                   << "::unchecked_cast(raw_object).AllocatedSize();\n";
+      }
+      h_contents << "  }\n\n";
+
+      h_contents << "};\n";
+    }
+
+    WriteFile(output_directory + "/" + file_name, h_contents.str());
+}
+
+namespace {
+
+// Generate verification code for a single piece of class data, which might be
+// nested within a struct or might be a single element in an indexed field (or
+// both).
+void GenerateFieldValueVerifier(const std::string& class_name, bool indexed,
+                                std::string offset, const Field& leaf_field,
+                                std::string indexed_field_size,
+                                std::ostream& cc_contents, bool is_map) {
+  const Type* field_type = leaf_field.name_and_type.type;
+
+  bool maybe_object =
+      !field_type->IsSubtypeOf(TypeOracle::GetStrongTaggedType());
+  const char* object_type = maybe_object ? "MaybeObject" : "Object";
+  const char* verify_fn =
+      maybe_object ? "VerifyMaybeObjectPointer" : "VerifyPointer";
+  if (indexed) {
+    offset += " + i * " + indexed_field_size;
+  }
+  // Name the local var based on the field name for nicer CHECK output.
+  const std::string value = leaf_field.name_and_type.name + "__value";
+
+  // Read the field.
+  if (is_map) {
+    cc_contents << "    " << object_type << " " << value << " = o.map();\n";
+  } else {
+    cc_contents << "    " << object_type << " " << value << " = TaggedField<"
+                << object_type << ">::load(o, " << offset << ");\n";
+  }
+
+  // Call VerifyPointer or VerifyMaybeObjectPointer on it.
+  cc_contents << "    " << object_type << "::" << verify_fn << "(isolate, "
+              << value << ");\n";
+
+  // Check that the value is of an appropriate type. We can skip this part for
+  // the Object type because it would not check anything beyond what we already
+  // checked with VerifyPointer.
+  if (field_type != TypeOracle::GetObjectType()) {
+    cc_contents << "    CHECK(" << GenerateRuntimeTypeCheck(field_type, value)
+                << ");\n";
+  }
+}
+
+void GenerateClassFieldVerifier(const std::string& class_name,
+                                const ClassType& class_type, const Field& f,
+                                std::ostream& h_contents,
+                                std::ostream& cc_contents) {
+  const Type* field_type = f.name_and_type.type;
+
+  // We only verify tagged types, not raw numbers or pointers. Structs
+  // consisting of tagged types are also included.
+  if (!field_type->IsSubtypeOf(TypeOracle::GetTaggedType()) &&
+      !field_type->StructSupertype())
+    return;
+  if (field_type == TypeOracle::GetFloat64OrHoleType()) return;
+  // Do not verify if the field may be uninitialized.
+  if (TypeOracle::GetUninitializedType()->IsSubtypeOf(field_type)) return;
+
+  std::string field_start_offset;
+  if (f.index) {
+    field_start_offset = f.name_and_type.name + "__offset";
+    std::string length = f.name_and_type.name + "__length";
+    cc_contents << "  intptr_t " << field_start_offset << ", " << length
+                << ";\n";
+    cc_contents << "  std::tie(std::ignore, " << field_start_offset << ", "
+                << length << ") = "
+                << Callable::PrefixNameForCCOutput(
+                       class_type.GetSliceMacroName(f))
+                << "(o);\n";
+
+    // Slices use intptr, but TaggedField<T>.load() uses int, so verify that
+    // such a cast is valid.
+    cc_contents << "  CHECK_EQ(" << field_start_offset << ", static_cast<int>("
+                << field_start_offset << "));\n";
+    cc_contents << "  CHECK_EQ(" << length << ", static_cast<int>(" << length
+                << "));\n";
+    field_start_offset = "static_cast<int>(" + field_start_offset + ")";
+    length = "static_cast<int>(" + length + ")";
+
+    cc_contents << "  for (int i = 0; i < " << length << "; ++i) {\n";
+  } else {
+    // Non-indexed fields have known offsets.
+    field_start_offset = std::to_string(*f.offset);
+    cc_contents << "  {\n";
+  }
+
+  if (auto struct_type = field_type->StructSupertype()) {
+    for (const Field& struct_field : (*struct_type)->fields()) {
+      if (struct_field.name_and_type.type->IsSubtypeOf(
+              TypeOracle::GetTaggedType())) {
+        GenerateFieldValueVerifier(
+            class_name, f.index.has_value(),
+            field_start_offset + " + " + std::to_string(*struct_field.offset),
+            struct_field, std::to_string((*struct_type)->PackedSize()),
+            cc_contents, f.name_and_type.name == "map");
+      }
+    }
+  } else {
+    GenerateFieldValueVerifier(class_name, f.index.has_value(),
+                               field_start_offset, f, "kTaggedSize",
+                               cc_contents, f.name_and_type.name == "map");
+  }
+
+  cc_contents << "  }\n";
+}
+
+}  // namespace
+
+void ImplementationVisitor::GenerateClassVerifiers(
+    const std::string& output_directory) {
+  std::string file_name = "class-verifiers";
+  std::stringstream h_contents;
+  std::stringstream cc_contents;
+  {
+    IncludeGuardScope include_guard(h_contents, file_name + ".h");
+    IfDefScope verify_heap_h(h_contents, "VERIFY_HEAP");
+    IfDefScope verify_heap_cc(cc_contents, "VERIFY_HEAP");
+
+    h_contents << "#include \"src/base/macros.h\"\n\n";
+
+    cc_contents << "#include \"torque-generated/" << file_name << ".h\"\n\n";
+    cc_contents << "#include \"src/objects/all-objects-inl.h\"\n";
+
+    IncludeObjectMacrosScope object_macros(cc_contents);
+
+    NamespaceScope h_namespaces(h_contents, {"v8", "internal"});
+    NamespaceScope cc_namespaces(cc_contents, {"v8", "internal"});
+
+    cc_contents
+        << "#include \"torque-generated/test/torque/test-torque-tq-inl.inc\"\n";
+
+    // Generate forward declarations to avoid including any headers.
+    h_contents << "class Isolate;\n";
+    for (const ClassType* type : TypeOracle::GetClasses()) {
+      if (!type->ShouldGenerateVerify()) continue;
+      h_contents << "class " << type->name() << ";\n";
+    }
+
+    const char* verifier_class = "TorqueGeneratedClassVerifiers";
+
+    h_contents << "class V8_EXPORT_PRIVATE " << verifier_class << "{\n";
+    h_contents << " public:\n";
+
+    for (const ClassType* type : TypeOracle::GetClasses()) {
+      std::string name = type->name();
+      if (!type->ShouldGenerateVerify()) continue;
+
+      std::string method_name = name + "Verify";
+
+      h_contents << "  static void " << method_name << "(" << name
+                 << " o, Isolate* isolate);\n";
+
+      cc_contents << "void " << verifier_class << "::" << method_name << "("
+                  << name << " o, Isolate* isolate) {\n";
+
+      // First, do any verification for the super class. Not all classes have
+      // verifiers, so skip to the nearest super class that has one.
+      const ClassType* super_type = type->GetSuperClass();
+      while (super_type && !super_type->ShouldGenerateVerify()) {
+        super_type = super_type->GetSuperClass();
+      }
+      if (super_type) {
+        std::string super_name = super_type->name();
+        cc_contents << "  o." << super_name << "Verify(isolate);\n";
+      }
+
+      // Second, verify that this object is what it claims to be.
+      cc_contents << "  CHECK(o.Is" << name << "(isolate));\n";
+
+      // Third, verify its properties.
+      for (auto f : type->fields()) {
+        GenerateClassFieldVerifier(name, *type, f, h_contents, cc_contents);
+      }
+
+      cc_contents << "}\n";
+    }
+
+    h_contents << "};\n";
+  }
+  WriteFile(output_directory + "/" + file_name + ".h", h_contents.str());
+  WriteFile(output_directory + "/" + file_name + ".cc", cc_contents.str());
+}
+
+void ImplementationVisitor::GenerateEnumVerifiers(
+    const std::string& output_directory) {
+  std::string file_name = "enum-verifiers";
+  std::stringstream cc_contents;
+  {
+    cc_contents << "#include \"src/compiler/code-assembler.h\"\n";
+    for (const std::string& include_path : GlobalContext::CppIncludes()) {
+      cc_contents << "#include " << StringLiteralQuote(include_path) << "\n";
+    }
+    cc_contents << "\n";
+
+    NamespaceScope cc_namespaces(cc_contents, {"v8", "internal", ""});
+
+    cc_contents << "class EnumVerifier {\n";
+    for (const auto& desc : GlobalContext::Get().ast()->EnumDescriptions()) {
+      cc_contents << "  // " << desc.name << " (" << desc.pos << ")\n";
+      cc_contents << "  void VerifyEnum_" << desc.name << "("
+                  << desc.constexpr_generates
+                  << " x) {\n"
+                     "    switch(x) {\n";
+      for (const auto& entry : desc.entries) {
+        cc_contents << "      case " << entry << ": break;\n";
+      }
+      if (desc.is_open) cc_contents << "      default: break;\n";
+      cc_contents << "    }\n  }\n\n";
+    }
+    cc_contents << "};\n";
+  }
+
+  WriteFile(output_directory + "/" + file_name + ".cc", cc_contents.str());
+}
+
+void ImplementationVisitor::GenerateExportedMacrosAssembler(
+    const std::string& output_directory) {
+  std::string file_name = "exported-macros-assembler";
+  std::stringstream h_contents;
+  std::stringstream cc_contents;
+  {
+    IncludeGuardScope include_guard(h_contents, file_name + ".h");
+
+    h_contents << "#include \"src/compiler/code-assembler.h\"\n";
+    h_contents << "#include \"src/execution/frames.h\"\n";
+    h_contents << "#include \"torque-generated/csa-types.h\"\n";
+
+    for (const std::string& include_path : GlobalContext::CppIncludes()) {
+      cc_contents << "#include " << StringLiteralQuote(include_path) << "\n";
+    }
+    cc_contents << "#include \"torque-generated/" << file_name << ".h\"\n";
+
+    for (SourceId file : SourceFileMap::AllSources()) {
+      cc_contents << "#include \"torque-generated/" +
+                         SourceFileMap::PathFromV8RootWithoutExtension(file) +
+                         "-tq-csa.h\"\n";
+    }
+
+    NamespaceScope h_namespaces(h_contents, {"v8", "internal"});
+    NamespaceScope cc_namespaces(cc_contents, {"v8", "internal"});
+
+    h_contents << "class V8_EXPORT_PRIVATE "
+                  "TorqueGeneratedExportedMacrosAssembler {\n"
+               << " public:\n"
+               << "  explicit TorqueGeneratedExportedMacrosAssembler"
+                  "(compiler::CodeAssemblerState* state) : state_(state) {\n"
+               << "    USE(state_);\n"
+               << "  }\n";
+
+    for (auto& declarable : GlobalContext::AllDeclarables()) {
+      TorqueMacro* macro = TorqueMacro::DynamicCast(declarable.get());
+      if (!(macro && macro->IsExportedToCSA())) continue;
+      CurrentSourcePosition::Scope position_activator(macro->Position());
+
+      cpp::Class assembler("TorqueGeneratedExportedMacrosAssembler");
+      std::vector<std::string> generated_parameter_names;
+      cpp::Function f = GenerateFunction(
+          &assembler, macro->ReadableName(), macro->signature(),
+          macro->parameter_names(), false, &generated_parameter_names);
+
+      f.PrintDeclaration(h_contents);
+      f.PrintDefinition(cc_contents, [&](std::ostream& stream) {
+        stream << "return " << macro->ExternalName() << "(state_";
+        for (const auto& name : generated_parameter_names) {
+          stream << ", " << name;
+        }
+        stream << ");";
+      });
+    }
+
+    h_contents << " private:\n"
+               << "  compiler::CodeAssemblerState* state_;\n"
+               << "};\n";
+  }
+  WriteFile(output_directory + "/" + file_name + ".h", h_contents.str());
+  WriteFile(output_directory + "/" + file_name + ".cc", cc_contents.str());
+}
+
+namespace {
+
+void CollectAllFields(const std::string& path, const Field& field,
+                      std::vector<std::string>& result) {
+  if (field.name_and_type.type->StructSupertype()) {
+    std::string next_path = path + field.name_and_type.name + ".";
+    const StructType* struct_type =
+        StructType::DynamicCast(field.name_and_type.type);
+    for (const auto& inner_field : struct_type->fields()) {
+      CollectAllFields(next_path, inner_field, result);
+    }
+  } else {
+    result.push_back(path + field.name_and_type.name);
   }
 }
 
 }  // namespace
 
-void ImplementationVisitor::GenerateClassDefinitions(std::string& file_name) {
-  std::stringstream new_contents_stream;
-  new_contents_stream << "#ifndef V8_CLASS_BUILTIN_DEFINITIONS_FROM_DSL_H_\n"
-                         "#define V8_CLASS_BUILTIN_DEFINITIONS_FROM_DSL_H_\n"
-                         "\n\n";
+void ImplementationVisitor::GenerateCSATypes(
+    const std::string& output_directory) {
+  std::string file_name = "csa-types";
+  std::stringstream h_contents;
+  {
+    IncludeGuardScope include_guard(h_contents, file_name + ".h");
+    h_contents << "#include \"src/compiler/code-assembler.h\"\n\n";
 
-  for (auto i : GlobalContext::GetClasses()) {
-    ClassType* type = i.second;
-    if (!type->IsExtern()) continue;
+    NamespaceScope h_namespaces(h_contents, {"v8", "internal"});
 
-    // TODO(danno): Ideally (and we've got several core V8 dev's feedback
-    // supporting this), Torque should generate the constants for the offsets
-    // directly and not go through the existing layer of macros, which actually
-    // currently just serves to additionally obfuscate where these values come
-    // from.
-    new_contents_stream << "#define ";
-    new_contents_stream << "TORQUE_GENERATED_"
-                        << CapifyStringWithUnderscores(i.first)
-                        << "_FIELDS(V) \\\n";
-    std::vector<Field> fields = type->fields();
-    FieldSectionType section = FieldSectionType::kNoSection;
-    std::set<FieldSectionType> completed_sections;
-    for (auto f : fields) {
-      CurrentSourcePosition::Scope scope(f.pos);
-      if (f.name_and_type.type->IsSubtypeOf(TypeOracle::GetTaggedType())) {
-        if (f.is_weak) {
-          ProcessFieldInSection(&section, &completed_sections,
-                                FieldSectionType::kWeakSection,
-                                &new_contents_stream);
-        } else {
-          ProcessFieldInSection(&section, &completed_sections,
-                                FieldSectionType::kStrongSection,
-                                &new_contents_stream);
-        }
-      } else {
-        ProcessFieldInSection(&section, &completed_sections,
-                              FieldSectionType::kScalarSection,
-                              &new_contents_stream);
+    // Generates headers for all structs in a topologically-sorted order, since
+    // TypeOracle keeps them in the order of their resolution
+    for (const auto& type : TypeOracle::GetAggregateTypes()) {
+      const StructType* struct_type = StructType::DynamicCast(type.get());
+      if (!struct_type) continue;
+      h_contents << "struct " << struct_type->GetGeneratedTypeNameImpl()
+                 << " {\n";
+      for (auto& field : struct_type->fields()) {
+        h_contents << "  " << field.name_and_type.type->GetGeneratedTypeName();
+        h_contents << " " << field.name_and_type.name << ";\n";
       }
-      size_t field_size;
-      std::string size_string;
-      std::string machine_type;
-      std::tie(field_size, size_string, machine_type) =
-          f.GetFieldSizeInformation();
-      new_contents_stream << "V(k" << CamelifyString(f.name_and_type.name)
-                          << "Offset, " << size_string << ") \\\n";
+      h_contents << "\n  std::tuple<";
+      bool first = true;
+      for (const Type* lowered_type : LowerType(struct_type)) {
+        if (!first) {
+          h_contents << ", ";
+        }
+        first = false;
+        h_contents << lowered_type->GetGeneratedTypeName();
+      }
+      std::vector<std::string> all_fields;
+      for (auto& field : struct_type->fields()) {
+        CollectAllFields("", field, all_fields);
+      }
+      h_contents << "> Flatten() const {\n"
+                    "    return std::make_tuple(";
+      PrintCommaSeparatedList(h_contents, all_fields);
+      h_contents << ");\n";
+      h_contents << "  }\n";
+      h_contents << "};\n";
     }
-
-    ProcessFieldInSection(&section, &completed_sections,
-                          FieldSectionType::kNoSection, &new_contents_stream);
-    CompleteFieldSection(&section, &completed_sections,
-                         FieldSectionType::kWeakSection, &new_contents_stream);
-    CompleteFieldSection(&section, &completed_sections,
-                         FieldSectionType::kStrongSection,
-                         &new_contents_stream);
-
-    new_contents_stream << "V(kSize, 0) \\\n";
-    new_contents_stream << "\n";
   }
-
-  new_contents_stream
-      << "\n#endif  // V8_CLASS_BUILTIN_DEFINITIONS_FROM_DSL_H_\n";
-
-  std::string new_contents(new_contents_stream.str());
-  ReplaceFileContentsIfDifferent(file_name, new_contents);
+  WriteFile(output_directory + "/" + file_name + ".h", h_contents.str());
 }
 
-void ImplementationVisitor::GeneratePrintDefinitions(std::string& file_name) {
-  std::stringstream new_contents_stream;
+void ReportAllUnusedMacros() {
+  for (const auto& declarable : GlobalContext::AllDeclarables()) {
+    if (!declarable->IsMacro() || declarable->IsExternMacro()) continue;
 
-  new_contents_stream << "#ifdef OBJECT_PRINT\n\n";
+    Macro* macro = Macro::cast(declarable.get());
+    if (macro->IsUsed()) continue;
 
-  new_contents_stream << "#include \"src/objects.h\"\n\n";
-  new_contents_stream << "#include <iosfwd>\n\n";
-  new_contents_stream << "#include \"src/objects/struct-inl.h\"\n\n";
-
-  new_contents_stream << "namespace v8 {\n";
-  new_contents_stream << "namespace internal {\n\n";
-
-  for (auto i : GlobalContext::GetClasses()) {
-    ClassType* type = i.second;
-    if (!type->ShouldGeneratePrint()) continue;
-
-    new_contents_stream << "void " << type->name() << "::" << type->name()
-                        << "Print(std::ostream& os) {\n";
-    new_contents_stream << "  PrintHeader(os, \"" << type->name() << "\");\n";
-    auto hierarchy = type->GetHierarchy();
-    std::map<std::string, const AggregateType*> field_names;
-    for (const AggregateType* aggregate_type : hierarchy) {
-      for (const Field& f : aggregate_type->fields()) {
-        if (f.name_and_type.name == "map") continue;
-        new_contents_stream << "  os << \"\\n - " << f.name_and_type.name
-                            << ": \" << "
-                            << "Brief(" << f.name_and_type.name << "());\n";
+    if (macro->IsTorqueMacro() && TorqueMacro::cast(macro)->IsExportedToCSA()) {
+      continue;
+    }
+    // TODO(gsps): Mark methods of generic structs used if they are used in any
+    // instantiation
+    if (Method* method = Method::DynamicCast(macro)) {
+      if (StructType* struct_type =
+              StructType::DynamicCast(method->aggregate_type())) {
+        if (struct_type->GetSpecializedFrom().has_value()) {
+          continue;
+        }
       }
     }
-    new_contents_stream << "  os << \"\\n\";\n";
-    new_contents_stream << "}\n\n";
+
+    std::vector<std::string> ignored_prefixes = {"Convert<", "Cast<",
+                                                 "FromConstexpr<"};
+    const std::string name = macro->ReadableName();
+    const bool ignore =
+        StartsWithSingleUnderscore(name) ||
+        std::any_of(ignored_prefixes.begin(), ignored_prefixes.end(),
+                    [&name](const std::string& prefix) {
+                      return StringStartsWith(name, prefix);
+                    });
+
+    if (!ignore) {
+      Lint("Macro '", macro->ReadableName(), "' is never used.")
+          .Position(macro->IdentifierPosition());
+    }
   }
-
-  new_contents_stream << "}  // namespace internal\"\n";
-  new_contents_stream << "}  // namespace v8\"\n";
-
-  new_contents_stream << "\n#endif  // OBJECT_PRINT\n\n";
-
-  std::string new_contents(new_contents_stream.str());
-  ReplaceFileContentsIfDifferent(file_name, new_contents);
 }
 
 }  // namespace torque

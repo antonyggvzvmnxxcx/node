@@ -36,7 +36,8 @@ function testWithJSMarshaller({
   quitAfter,
   abort,
   maxQueueSize,
-  launchSecondary }) {
+  launchSecondary,
+}) {
   return new Promise((resolve) => {
     const array = [];
     binding[threadStarter](function testCallback(value) {
@@ -97,6 +98,17 @@ new Promise(function testWithoutJSMarshaller(resolve) {
 // Quit after it's done.
 .then(() => testWithJSMarshaller({
   threadStarter: 'StartThread',
+  maxQueueSize: binding.MAX_QUEUE_SIZE,
+  quitAfter: binding.ARRAY_LENGTH
+}))
+.then((result) => assert.deepStrictEqual(result, expectedArray))
+
+// Start the thread in blocking mode, and assert that all values are passed.
+// Quit after it's done.
+// Doesn't pass the callback js function to napi_create_threadsafe_function.
+// Instead, use an alternative reference to get js function called.
+.then(() => testWithJSMarshaller({
+  threadStarter: 'StartThreadNoJsFunc',
   maxQueueSize: binding.MAX_QUEUE_SIZE,
   quitAfter: binding.ARRAY_LENGTH
 }))
@@ -198,6 +210,15 @@ new Promise(function testWithoutJSMarshaller(resolve) {
   abort: true
 }))
 .then((result) => assert.strictEqual(result.indexOf(0), -1))
+
+// Make sure that threadsafe function isn't stalled when we hit
+// `kMaxIterationCount` in `src/node_api.cc`
+.then(() => testWithJSMarshaller({
+  threadStarter: 'StartThreadNonblocking',
+  maxQueueSize: binding.ARRAY_LENGTH >>> 1,
+  quitAfter: binding.ARRAY_LENGTH
+}))
+.then((result) => assert.deepStrictEqual(result, expectedArray))
 
 // Start a child process to test rapid teardown
 .then(() => testUnref(binding.MAX_QUEUE_SIZE))

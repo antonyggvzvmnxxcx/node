@@ -8,7 +8,7 @@
 #include "src/objects/cell.h"
 
 #include "src/heap/heap-write-barrier-inl.h"
-#include "src/objects-inl.h"
+#include "src/objects/objects-inl.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -16,14 +16,12 @@
 namespace v8 {
 namespace internal {
 
-OBJECT_CONSTRUCTORS_IMPL(Cell, HeapObject)
+#include "torque-generated/src/objects/cell-tq-inl.inc"
 
-CAST_ACCESSOR(Cell)
+TQ_OBJECT_CONSTRUCTORS_IMPL(Cell)
 
-ACCESSORS(Cell, value, Object, kValueOffset)
-
-Cell Cell::FromValueAddress(Address value) {
-  return Cell::cast(HeapObject::FromAddress(value - kValueOffset));
+DEF_RELAXED_GETTER(Cell, value, Object) {
+  return TaggedField<Object, kValueOffset>::Relaxed_Load(cage_base, *this);
 }
 
 }  // namespace internal

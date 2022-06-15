@@ -55,13 +55,13 @@ const bench = common.createBenchmark(main, {
 
 function main({ n, input }) {
   let inputs = [input];
-  if (groupedInputs.hasOwnProperty(input)) {
+  if (Object.hasOwn(groupedInputs, input)) {
     inputs = groupedInputs[input];
   }
 
   const len = inputs.length;
   bench.start();
-  for (var i = 0; i < n; i++) {
+  for (let i = 0; i < n; i++) {
     _checkInvalidHeaderChar(inputs[i % len]);
   }
   bench.end(n);

@@ -5,9 +5,9 @@
 #ifndef V8_CCTEST_COMPILER_CALL_TESTER_H_
 #define V8_CCTEST_COMPILER_CALL_TESTER_H_
 
-#include "src/handles.h"
+#include "src/execution/simulator.h"
+#include "src/handles/handles.h"
 #include "src/objects/code.h"
-#include "src/simulator.h"
 #include "test/cctest/compiler/c-signature.h"
 
 namespace v8 {
@@ -55,6 +55,10 @@ class CodeRunner : public CallHelper<T> {
  public:
   CodeRunner(Isolate* isolate, Handle<Code> code, MachineSignature* csig)
       : CallHelper<T>(isolate, csig), code_(code) {}
+#ifdef V8_EXTERNAL_CODE_SPACE
+  CodeRunner(Isolate* isolate, Handle<CodeT> code, MachineSignature* csig)
+      : CallHelper<T>(isolate, csig), code_(FromCodeT(*code), isolate) {}
+#endif  // V8_EXTERNAL_CODE_SPACE
   ~CodeRunner() override = default;
 
   Address Generate() override { return code_->entry(); }

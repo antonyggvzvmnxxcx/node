@@ -4,5 +4,5 @@ function fib(n) {
   return fib(n - 1) + fib(n - 2);
 }
 
-const n = parseInt(process.env.FIB) || 35;
+const n = parseInt(process.env.FIB, 10) || 40;
 process.stdout.write(`${fib(n)}\n`);

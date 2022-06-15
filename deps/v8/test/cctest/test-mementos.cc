@@ -25,10 +25,10 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#include "src/execution/isolate.h"
 #include "src/heap/factory.h"
 #include "src/heap/heap-inl.h"
-#include "src/isolate.h"
-#include "src/objects-inl.h"
+#include "src/objects/objects-inl.h"
 #include "test/cctest/cctest.h"
 
 namespace v8 {
@@ -51,9 +51,9 @@ static void SetUpNewSpaceWithPoisonedMementoAtTop() {
   // site pointer.
   AllocationMemento memento = AllocationMemento::unchecked_cast(
       Object(new_space->top() + kHeapObjectTag));
-  memento->set_map_after_allocation(
-      ReadOnlyRoots(heap).allocation_memento_map(), SKIP_WRITE_BARRIER);
-  memento->set_allocation_site(
+  memento.set_map_after_allocation(ReadOnlyRoots(heap).allocation_memento_map(),
+                                   SKIP_WRITE_BARRIER);
+  memento.set_allocation_site(
       AllocationSite::unchecked_cast(Object(kHeapObjectTag)),
       SKIP_WRITE_BARRIER);
 }
@@ -61,7 +61,7 @@ static void SetUpNewSpaceWithPoisonedMementoAtTop() {
 
 TEST(Regress340063) {
   CcTest::InitializeVM();
-  if (!i::FLAG_allocation_site_pretenuring) return;
+  if (!i::FLAG_allocation_site_pretenuring || FLAG_single_generation) return;
   v8::HandleScope scope(CcTest::isolate());
 
   SetUpNewSpaceWithPoisonedMementoAtTop();
@@ -74,7 +74,7 @@ TEST(Regress340063) {
 
 TEST(Regress470390) {
   CcTest::InitializeVM();
-  if (!i::FLAG_allocation_site_pretenuring) return;
+  if (!i::FLAG_allocation_site_pretenuring || FLAG_single_generation) return;
   v8::HandleScope scope(CcTest::isolate());
 
   SetUpNewSpaceWithPoisonedMementoAtTop();
@@ -91,7 +91,7 @@ TEST(Regress470390) {
 
 TEST(BadMementoAfterTopForceScavenge) {
   CcTest::InitializeVM();
-  if (!i::FLAG_allocation_site_pretenuring) return;
+  if (!i::FLAG_allocation_site_pretenuring || FLAG_single_generation) return;
   v8::HandleScope scope(CcTest::isolate());
 
   SetUpNewSpaceWithPoisonedMementoAtTop();

@@ -21,12 +21,13 @@
 
 #include "tcp_wrap.h"
 
+#include "connect_wrap.h"
 #include "connection_wrap.h"
 #include "env-inl.h"
 #include "handle_wrap.h"
 #include "node_buffer.h"
+#include "node_external_reference.h"
 #include "node_internals.h"
-#include "connect_wrap.h"
 #include "stream_base-inl.h"
 #include "stream_wrap.h"
 #include "util-inl.h"
@@ -42,7 +43,6 @@ using v8::EscapableHandleScope;
 using v8::Function;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
-using v8::HandleScope;
 using v8::Int32;
 using v8::Integer;
 using v8::Local;
@@ -75,10 +75,7 @@ void TCPWrap::Initialize(Local<Object> target,
   Environment* env = Environment::GetCurrent(context);
 
   Local<FunctionTemplate> t = env->NewFunctionTemplate(New);
-  Local<String> tcpString = FIXED_ONE_BYTE_STRING(env->isolate(), "TCP");
-  t->SetClassName(tcpString);
-  t->InstanceTemplate()
-    ->SetInternalFieldCount(StreamBase::kStreamBaseFieldCount);
+  t->InstanceTemplate()->SetInternalFieldCount(StreamBase::kInternalFieldCount);
 
   // Init properties
   t->InstanceTemplate()->Set(FIXED_ONE_BYTE_STRING(env->isolate(), "reading"),
@@ -100,26 +97,20 @@ void TCPWrap::Initialize(Local<Object> target,
                       GetSockOrPeerName<TCPWrap, uv_tcp_getpeername>);
   env->SetProtoMethod(t, "setNoDelay", SetNoDelay);
   env->SetProtoMethod(t, "setKeepAlive", SetKeepAlive);
+  env->SetProtoMethod(t, "reset", Reset);
 
 #ifdef _WIN32
   env->SetProtoMethod(t, "setSimultaneousAccepts", SetSimultaneousAccepts);
 #endif
 
-  target->Set(env->context(),
-              tcpString,
-              t->GetFunction(env->context()).ToLocalChecked()).Check();
+  env->SetConstructorFunction(target, "TCP", t);
   env->set_tcp_constructor_template(t);
 
   // Create FunctionTemplate for TCPConnectWrap.
   Local<FunctionTemplate> cwt =
       BaseObject::MakeLazilyInitializedJSTemplate(env);
   cwt->Inherit(AsyncWrap::GetConstructorTemplate(env));
-  Local<String> wrapString =
-      FIXED_ONE_BYTE_STRING(env->isolate(), "TCPConnectWrap");
-  cwt->SetClassName(wrapString);
-  target->Set(env->context(),
-              wrapString,
-              cwt->GetFunction(env->context()).ToLocalChecked()).Check();
+  env->SetConstructorFunction(target, "TCPConnectWrap", cwt);
 
   // Define constants
   Local<Object> constants = Object::New(env->isolate());
@@ -131,6 +122,24 @@ void TCPWrap::Initialize(Local<Object> target,
               constants).Check();
 }
 
+void TCPWrap::RegisterExternalReferences(ExternalReferenceRegistry* registry) {
+  registry->Register(New);
+  registry->Register(Open);
+  registry->Register(Bind);
+  registry->Register(Listen);
+  registry->Register(Connect);
+  registry->Register(Bind6);
+  registry->Register(Connect6);
+
+  registry->Register(GetSockOrPeerName<TCPWrap, uv_tcp_getsockname>);
+  registry->Register(GetSockOrPeerName<TCPWrap, uv_tcp_getpeername>);
+  registry->Register(SetNoDelay);
+  registry->Register(SetKeepAlive);
+  registry->Register(Reset);
+#ifdef _WIN32
+  registry->Register(SetSimultaneousAccepts);
+#endif
+}
 
 void TCPWrap::New(const FunctionCallbackInfo<Value>& args) {
   // This constructor should not be exposed to public javascript.
@@ -186,7 +195,7 @@ void TCPWrap::SetKeepAlive(const FunctionCallbackInfo<Value>& args) {
   Environment* env = wrap->env();
   int enable;
   if (!args[0]->Int32Value(env->context()).To(&enable)) return;
-  unsigned int delay = args[1].As<Uint32>()->Value();
+  unsigned int delay = static_cast<unsigned int>(args[1].As<Uint32>()->Value());
   int err = uv_tcp_keepalive(&wrap->handle_, enable, delay);
   args.GetReturnValue().Set(err);
 }
@@ -279,7 +288,8 @@ void TCPWrap::Listen(const FunctionCallbackInfo<Value>& args) {
 
 void TCPWrap::Connect(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[2]->IsUint32());
-  int port = args[2].As<Uint32>()->Value();
+  // explicit cast to fit to libuv's type expectation
+  int port = static_cast<int>(args[2].As<Uint32>()->Value());
   Connect<sockaddr_in>(args,
                        [port](const char* ip_address, sockaddr_in* addr) {
       return uv_ip4_addr(ip_address, port, addr);
@@ -331,16 +341,39 @@ void TCPWrap::Connect(const FunctionCallbackInfo<Value>& args,
 
   args.GetReturnValue().Set(err);
 }
+void TCPWrap::Reset(const FunctionCallbackInfo<Value>& args) {
+  TCPWrap* wrap;
+  ASSIGN_OR_RETURN_UNWRAP(
+      &wrap, args.Holder(), args.GetReturnValue().Set(UV_EBADF));
 
+  int err = wrap->Reset(args[0]);
+
+  args.GetReturnValue().Set(err);
+}
+
+int TCPWrap::Reset(Local<Value> close_callback) {
+  if (state_ != kInitialized) return 0;
+
+  int err = uv_tcp_close_reset(&handle_, OnClose);
+  state_ = kClosing;
+  if (!err & !close_callback.IsEmpty() && close_callback->IsFunction() &&
+      !persistent().IsEmpty()) {
+    object()
+        ->Set(env()->context(), env()->handle_onclose_symbol(), close_callback)
+        .Check();
+  }
+  return err;
+}
 
 // also used by udp_wrap.cc
-Local<Object> AddressToJS(Environment* env,
-                          const sockaddr* addr,
-                          Local<Object> info) {
+MaybeLocal<Object> AddressToJS(Environment* env,
+                               const sockaddr* addr,
+                               Local<Object> info) {
   EscapableHandleScope scope(env->isolate());
-  char ip[INET6_ADDRSTRLEN];
+  char ip[INET6_ADDRSTRLEN + UV_IF_NAMESIZE];
   const sockaddr_in* a4;
   const sockaddr_in6* a6;
+
   int port;
 
   if (info.IsEmpty())
@@ -350,13 +383,28 @@ Local<Object> AddressToJS(Environment* env,
   case AF_INET6:
     a6 = reinterpret_cast<const sockaddr_in6*>(addr);
     uv_inet_ntop(AF_INET6, &a6->sin6_addr, ip, sizeof ip);
+    // Add an interface identifier to a link local address.
+    if (IN6_IS_ADDR_LINKLOCAL(&a6->sin6_addr) && a6->sin6_scope_id > 0) {
+      const size_t addrlen = strlen(ip);
+      CHECK_LT(addrlen, sizeof(ip));
+      ip[addrlen] = '%';
+      size_t scopeidlen = sizeof(ip) - addrlen - 1;
+      CHECK_GE(scopeidlen, UV_IF_NAMESIZE);
+      const int r = uv_if_indextoiid(a6->sin6_scope_id,
+                                     ip + addrlen + 1,
+                                     &scopeidlen);
+      if (r) {
+        env->ThrowUVException(r, "uv_if_indextoiid");
+        return {};
+      }
+    }
     port = ntohs(a6->sin6_port);
     info->Set(env->context(),
               env->address_string(),
               OneByteString(env->isolate(), ip)).Check();
     info->Set(env->context(),
               env->family_string(),
-              env->ipv6_string()).Check();
+              Integer::New(env->isolate(), 6)).Check();
     info->Set(env->context(),
               env->port_string(),
               Integer::New(env->isolate(), port)).Check();
@@ -371,7 +419,7 @@ Local<Object> AddressToJS(Environment* env,
               OneByteString(env->isolate(), ip)).Check();
     info->Set(env->context(),
               env->family_string(),
-              env->ipv4_string()).Check();
+              Integer::New(env->isolate(), 4)).Check();
     info->Set(env->context(),
               env->port_string(),
               Integer::New(env->isolate(), port)).Check();
@@ -390,3 +438,5 @@ Local<Object> AddressToJS(Environment* env,
 }  // namespace node
 
 NODE_MODULE_CONTEXT_AWARE_INTERNAL(tcp_wrap, node::TCPWrap::Initialize)
+NODE_MODULE_EXTERNAL_REFERENCE(tcp_wrap,
+                               node::TCPWrap::RegisterExternalReferences)

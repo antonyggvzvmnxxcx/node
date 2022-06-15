@@ -1,6 +1,7 @@
 #include "node_metadata.h"
 #include "ares.h"
 #include "brotli/encode.h"
+#include "llhttp.h"
 #include "nghttp2/nghttp2ver.h"
 #include "node.h"
 #include "util.h"
@@ -10,7 +11,15 @@
 
 #if HAVE_OPENSSL
 #include <openssl/opensslv.h>
+#if NODE_OPENSSL_HAS_QUIC
+#include <openssl/quic.h>
+#endif
 #endif  // HAVE_OPENSSL
+
+#ifdef OPENSSL_INFO_QUIC
+#include <ngtcp2/version.h>
+#include <nghttp3/version.h>
+#endif
 
 #ifdef NODE_HAVE_I18N_SUPPORT
 #include <unicode/timezone.h>
@@ -34,8 +43,10 @@ std::string GetOpenSSLVersion() {
   // sample openssl version string format
   // for reference: "OpenSSL 1.1.0i 14 Aug 2018"
   char buf[128];
-  const int start = search(OPENSSL_VERSION_TEXT, 0, ' ') + 1;
-  const int end = search(OPENSSL_VERSION_TEXT + start, start, ' ');
+  const char* etext = OPENSSL_VERSION_TEXT;
+  const int start = search(etext, 0, ' ') + 1;
+  etext += start;
+  const int end = search(etext, start, ' ');
   const int len = end - start;
   snprintf(buf, sizeof(buf), "%.*s", len, &OPENSSL_VERSION_TEXT[start]);
   return std::string(buf);
@@ -70,8 +81,12 @@ Metadata::Versions::Versions() {
   modules = NODE_STRINGIFY(NODE_MODULE_VERSION);
   nghttp2 = NGHTTP2_VERSION;
   napi = NODE_STRINGIFY(NAPI_VERSION);
-  llhttp = per_process::llhttp_version;
-  http_parser = per_process::http_parser_version;
+  llhttp =
+      NODE_STRINGIFY(LLHTTP_VERSION_MAJOR)
+      "."
+      NODE_STRINGIFY(LLHTTP_VERSION_MINOR)
+      "."
+      NODE_STRINGIFY(LLHTTP_VERSION_PATCH);
 
   brotli =
     std::to_string(BrotliEncoderVersion() >> 24) +
@@ -88,6 +103,11 @@ Metadata::Versions::Versions() {
   icu = U_ICU_VERSION;
   unicode = U_UNICODE_VERSION;
 #endif  // NODE_HAVE_I18N_SUPPORT
+
+#ifdef OPENSSL_INFO_QUIC
+  ngtcp2 = NGTCP2_VERSION;
+  nghttp3 = NGHTTP3_VERSION;
+#endif
 }
 
 Metadata::Release::Release() : name(NODE_RELEASE) {

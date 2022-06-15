@@ -25,9 +25,6 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# for py2/py3 compatibility
-from __future__ import print_function
-
 import imp
 import itertools
 import os
@@ -44,41 +41,41 @@ from testrunner.outproc import test262
 
 # TODO(littledan): move the flag mapping into the status file
 FEATURE_FLAGS = {
-  'class-fields-public': '--harmony-public-fields',
-  'class-static-fields-public': '--harmony-class-fields',
-  'class-fields-private': '--harmony-private-fields',
-  'class-static-fields-private': '--harmony-private-fields',
-  'String.prototype.matchAll': '--harmony-string-matchall',
-  'Symbol.matchAll': '--harmony-string-matchall',
-  'numeric-separator-literal': '--harmony-numeric-separator',
-  'Intl.DateTimeFormat-datetimestyle': '--harmony-intl-datetime-style',
-  'Intl.Locale': '--harmony-locale',
-  'Intl.Segmenter': '--harmony-intl-segmenter',
+  'Intl.NumberFormat-v3': '--harmony_intl_number_format_v3',
   'Symbol.prototype.description': '--harmony-symbol-description',
-  'globalThis': '--harmony-global',
-  'well-formed-json-stringify': '--harmony-json-stringify',
-  'export-star-as-namespace-from-module': '--harmony-namespace-exports',
-  'Object.fromEntries': '--harmony-object-from-entries',
-  'hashbang': '--harmony-hashbang',
-  'BigInt': '--harmony-intl-bigint',
+  'FinalizationRegistry': '--harmony-weak-refs-with-cleanup-some',
+  'WeakRef': '--harmony-weak-refs-with-cleanup-some',
+  'host-gc-required': '--expose-gc-as=v8GC',
+  'IsHTMLDDA': '--allow-natives-syntax',
+  'top-level-await': '--harmony-top-level-await',
+  'regexp-match-indices': '--harmony-regexp-match-indices',
+  'regexp-named-groups': '--harmony-regexp-match-indices',
+  'error-cause': '--harmony-error-cause',
+  'import-assertions': '--harmony-import-assertions',
+  'Object.hasOwn': '--harmony-object-has-own',
+  'class-static-block': '--harmony-class-static-blocks',
+  'resizable-arraybuffer': '--harmony-rab-gsab',
+  'Temporal': '--harmony-temporal',
+  'array-find-from-last': '--harmony_array_find_last',
+  'ShadowRealm': '--harmony-shadow-realm',
 }
 
-SKIPPED_FEATURES = set(['class-methods-private',
-                        'class-static-methods-private',
-                        'Intl.NumberFormat-unified'])
+SKIPPED_FEATURES = set([])
 
 DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+BASE_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEST_262_HARNESS_FILES = ["sta.js", "assert.js"]
 TEST_262_NATIVE_FILES = ["detachArrayBuffer.js"]
 
 TEST_262_SUITE_PATH = ["data", "test"]
 TEST_262_HARNESS_PATH = ["data", "harness"]
-TEST_262_TOOLS_PATH = ["harness", "src"]
+TEST_262_TOOLS_ABS_PATH = [BASE_DIR, "third_party", "test262-harness", "src"]
 TEST_262_LOCAL_TESTS_PATH = ["local-tests", "test"]
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             *TEST_262_TOOLS_PATH))
+sys.path.append(os.path.join(*TEST_262_TOOLS_ABS_PATH))
 
 
 class VariantsGenerator(testsuite.VariantsGenerator):
@@ -139,15 +136,14 @@ class TestSuite(testsuite.TestSuite):
     self.parse_test_record = self._load_parse_test_record()
 
   def _load_parse_test_record(self):
-    root = os.path.join(self.root, *TEST_262_TOOLS_PATH)
+    root = os.path.join(*TEST_262_TOOLS_ABS_PATH)
     f = None
     try:
       (f, pathname, description) = imp.find_module("parseTestRecord", [root])
       module = imp.load_module("parseTestRecord", f, pathname, description)
       return module.parseTestRecord
     except:
-      print ('Cannot load parseTestRecord; '
-             'you may need to gclient sync for test262')
+      print('Cannot load parseTestRecord')
       raise
     finally:
       if f:
@@ -205,6 +201,8 @@ class TestCase(testcase.D8TestCase):
         list(self.suite.harness) +
         ([os.path.join(self.suite.root, "harness-agent.js")]
          if self.__needs_harness_agent() else []) +
+        ([os.path.join(self.suite.root, "harness-ishtmldda.js")]
+         if "IsHTMLDDA" in self.test_record.get("features", []) else []) +
         ([os.path.join(self.suite.root, "harness-adapt-donotevaluate.js")]
          if self.fail_phase_only and not self._fail_phase_reverse else []) +
         self._get_includes() +
@@ -214,6 +212,7 @@ class TestCase(testcase.D8TestCase):
 
   def _get_suite_flags(self):
     return (
+        ["--ignore-unhandled-promises"] +
         (["--throws"] if "negative" in self.test_record else []) +
         (["--allow-natives-syntax"]
          if "detachArrayBuffer.js" in self.test_record.get("includes", [])
